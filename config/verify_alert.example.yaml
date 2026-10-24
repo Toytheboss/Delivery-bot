@@ -1,0 +1,6 @@
+# Add under workflow: in config/config.yaml (local only; not committed)
+  # Please verify → 看板人工队列 + Lark「delivery ops Lark group」提醒
+  verify_alert_enabled: true
+  verify_alert_lark_chat_id: "oc_xxxxxxxx"  # delivery ops Lark group
+  verify_alert_cooldown_hours: 6
+  verify_alert_state_file: "data/verify_alert_state.json"

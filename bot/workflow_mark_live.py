@@ -1,0 +1,851 @@
+"""TG keyword → update Lark Progress Tracker status to live (+ optional form send)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from bot.folder_scope import FolderScope
+from bot.lark_bitable import get_tenant_access_token, list_records, update_record
+from bot.workflow_form_dispatch import (
+    _field_text,
+    _normalize_name,
+    _parse_chat_id,
+    field_key,
+    is_manual_form_command,
+    match_project_to_chat,
+)
+from bot.workflow_live_trigger import process_live_project
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient
+
+    from bot.config_loader import AppConfig
+
+logger = logging.getLogger(__name__)
+
+ROOT = Path(__file__).resolve().parent.parent
+PENDING_PATH = ROOT / "data" / "mark_live_pending.json"
+SITE_PENDING_PATH = ROOT / "data" / "mark_live_site_pending.json"
+PENDING_TTL_SECONDS = 24 * 3600
+_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
+MISSING_SITE_REMINDER = (
+    "The project website field is empty. Please upload the project website.\n\n"
+    "Quote this message and reply with the official site URL (http:// or https://). "
+    "After it is saved, run mark live again."
+)
+
+
+def _english_status_label(text: str) -> str:
+    """Show only the English part of bilingual Lark option labels in TG.
+
+    Lark values look like ``主网部署中 Deploying on BOT Chain Mainnet``.
+    Writes to Lark still use the original option text.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return "(empty)"
+    last = None
+    for match in _CJK_RE.finditer(raw):
+        last = match
+    if last is not None:
+        suffix = raw[last.end() :].strip()
+        if suffix:
+            return suffix
+    stripped = re.sub(r"\s+", " ", _CJK_RE.sub(" ", raw)).strip()
+    return stripped or raw
+
+
+@dataclass
+class MarkLiveOutcome:
+    text: str
+    candidates: list[tuple[str, str]] | None = None  # (record_id, project_name)
+    # When set, Mark live is blocked until 已上线链接 is filled via quote-reply.
+    need_site: tuple[str, str] | None = None  # (record_id, project_name)
+
+
+def is_mark_live_command(text: str, commands: list[str]) -> bool:
+    return is_manual_form_command(text, commands)
+
+
+def _pending_key(chat_id: int, reply_msg_id: int) -> str:
+    return f"{chat_id}:{reply_msg_id}"
+
+
+def _load_pending() -> dict[str, Any]:
+    if not PENDING_PATH.exists():
+        return {"by_reply": {}}
+    try:
+        raw = json.loads(PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"by_reply": {}}
+    if not isinstance(raw, dict):
+        return {"by_reply": {}}
+    by_reply = raw.get("by_reply")
+    if not isinstance(by_reply, dict):
+        by_reply = {}
+    return {"by_reply": by_reply}
+
+
+def _save_pending(state: dict[str, Any]) -> None:
+    PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PENDING_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(PENDING_PATH)
+
+
+def _prune_pending(state: dict[str, Any], *, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    by_reply = state.setdefault("by_reply", {})
+    dead = [
+        key
+        for key, entry in list(by_reply.items())
+        if not isinstance(entry, dict) or float(entry.get("expires_at") or 0) <= now
+    ]
+    for key in dead:
+        by_reply.pop(key, None)
+
+
+def save_mark_live_pending(
+    *,
+    chat_id: int,
+    reply_msg_id: int,
+    chat_title: str,
+    candidates: list[tuple[str, str]],
+) -> None:
+    """Persist ambiguous candidates keyed by the bot reply message id."""
+    now = time.time()
+    state = _load_pending()
+    _prune_pending(state, now=now)
+    state["by_reply"][_pending_key(chat_id, reply_msg_id)] = {
+        "chat_id": int(chat_id),
+        "chat_title": chat_title,
+        "candidates": [
+            {"record_id": rid, "project_name": name} for rid, name in candidates
+        ],
+        "created_at": now,
+        "expires_at": now + PENDING_TTL_SECONDS,
+    }
+    _save_pending(state)
+
+
+def pop_mark_live_pending(chat_id: int, reply_msg_id: int) -> dict[str, Any] | None:
+    now = time.time()
+    state = _load_pending()
+    _prune_pending(state, now=now)
+    key = _pending_key(chat_id, reply_msg_id)
+    entry = state["by_reply"].pop(key, None)
+    if entry is not None:
+        _save_pending(state)
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("chat_id") or 0) != int(chat_id):
+        return None
+    return entry
+
+
+def peek_mark_live_pending(chat_id: int, reply_msg_id: int) -> dict[str, Any] | None:
+    now = time.time()
+    state = _load_pending()
+    _prune_pending(state, now=now)
+    entry = state["by_reply"].get(_pending_key(chat_id, reply_msg_id))
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("chat_id") or 0) != int(chat_id):
+        return None
+    return entry
+
+
+def _load_site_pending() -> dict[str, Any]:
+    if not SITE_PENDING_PATH.exists():
+        return {"by_reply": {}}
+    try:
+        raw = json.loads(SITE_PENDING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"by_reply": {}}
+    if not isinstance(raw, dict):
+        return {"by_reply": {}}
+    by_reply = raw.get("by_reply")
+    if not isinstance(by_reply, dict):
+        by_reply = {}
+    return {"by_reply": by_reply}
+
+
+def _save_site_pending(state: dict[str, Any]) -> None:
+    SITE_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SITE_PENDING_PATH.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    tmp.replace(SITE_PENDING_PATH)
+
+
+def save_mark_live_site_pending(
+    *,
+    chat_id: int,
+    reply_msg_id: int,
+    record_id: str,
+    project_name: str,
+) -> None:
+    """Persist the missing-website reminder so a quote-reply can fill 已上线链接."""
+    now = time.time()
+    state = _load_site_pending()
+    _prune_pending(state, now=now)
+    state["by_reply"][_pending_key(chat_id, reply_msg_id)] = {
+        "chat_id": int(chat_id),
+        "record_id": str(record_id),
+        "project_name": str(project_name),
+        "created_at": now,
+        "expires_at": now + PENDING_TTL_SECONDS,
+    }
+    _save_site_pending(state)
+
+
+def peek_mark_live_site_pending(chat_id: int, reply_msg_id: int) -> dict[str, Any] | None:
+    now = time.time()
+    state = _load_site_pending()
+    _prune_pending(state, now=now)
+    entry = state["by_reply"].get(_pending_key(chat_id, reply_msg_id))
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("chat_id") or 0) != int(chat_id):
+        return None
+    return entry
+
+
+def pop_mark_live_site_pending(chat_id: int, reply_msg_id: int) -> dict[str, Any] | None:
+    now = time.time()
+    state = _load_site_pending()
+    _prune_pending(state, now=now)
+    key = _pending_key(chat_id, reply_msg_id)
+    entry = state["by_reply"].pop(key, None)
+    if entry is not None:
+        _save_site_pending(state)
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("chat_id") or 0) != int(chat_id):
+        return None
+    return entry
+
+
+def live_site_missing(config: AppConfig, fields: dict[str, Any]) -> bool:
+    """True when progress「已上线链接」has no http(s) URL."""
+    from bot.workflow_live_link_sync import extract_http_site_url
+
+    from bot.workflow_form_dispatch import field_raw
+
+    live_field = str(
+        getattr(config, "workflow_live_link_field", "")
+        or "已上线链接🔗 Project Website URL"
+    ).strip()
+    return not extract_http_site_url(field_raw(fields, live_field))
+
+
+def _pick_candidate(
+    picked_name: str,
+    candidates: list[tuple[str, str]],
+) -> tuple[str, str] | None | list[tuple[str, str]]:
+    """Return (record_id, name), None if no match, or list if still ambiguous."""
+    want = _normalize_name(picked_name)
+    if not want:
+        return None
+
+    exact = [(rid, name) for rid, name in candidates if _normalize_name(name) == want]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return exact
+
+    partial = [
+        (rid, name)
+        for rid, name in candidates
+        if want in _normalize_name(name) or _normalize_name(name) in want
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        return partial
+    return None
+
+
+def _ambiguous_text(matches: list[tuple[str, str]]) -> str:
+    names = ", ".join(name for _, name in matches)
+    return (
+        f"Ambiguous match ({len(matches)}): {names}.\n"
+        "Quote this message and reply with the exact project name to continue."
+    )
+
+
+async def _maybe_write_tg_chat_id(
+    loop: asyncio.AbstractEventLoop,
+    token: str,
+    config: AppConfig,
+    *,
+    record_id: str,
+    fields: dict[str, Any],
+    chat_id: int,
+) -> str | None:
+    field = (config.workflow_tg_chat_id_field or "").strip()
+    if not field:
+        return None
+    existing = _parse_chat_id(_field_text(fields, field))
+    if existing == chat_id:
+        return None
+    try:
+        await loop.run_in_executor(
+            None,
+            update_record,
+            token,
+            config.workflow_base_app_token,
+            config.workflow_progress_table_id,
+            record_id,
+            {field: str(chat_id)},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "mark_live: failed writing tg chat id field=%r record=%s chat=%s",
+            field,
+            record_id,
+            chat_id,
+        )
+        return "Couldn't link this group on the sheet."
+    logger.info(
+        "mark_live: wrote tg chat id field=%r record=%s chat=%s",
+        field,
+        record_id,
+        chat_id,
+    )
+    return "Linked this group on the sheet."
+
+
+def _speaker_label(speaker: str) -> str:
+    return "The delivery account" if speaker == "josh" else "The audit account"
+
+
+async def _prepare_mark_live_form_speaker(
+    client: TelegramClient,
+    config: AppConfig,
+    *,
+    record_id: str,
+    project_name: str,
+    chat_id: int,
+    chat_title: str,
+) -> str | None:
+    """Reserve the form slot, then assign the other bot when both are in the group.
+
+    Reserve happens before any await so a progress-table scan cannot start the
+    bubbles during the membership lookup.
+    """
+    if not config.workflow_mark_live_also_send_form or not config.workflow_google_form_url:
+        return None
+    from bot.workflow_form_claim import (
+        assign_form_sender,
+        claim_path_for,
+        live_form_speaker,
+        other_account,
+        reserve_form_send,
+    )
+    from bot.workflow_live_onboard import (
+        account_key,
+        load_peer_folder_titles,
+        lookup_peer_in_chat,
+        remember_group_membership,
+    )
+
+    issuer = account_key(config)
+    path = claim_path_for(config)
+    reserve_form_send(
+        path,
+        record_id,
+        chat_id=chat_id,
+        project_name=project_name,
+        chat_title=chat_title,
+        requested_by=issuer,
+    )
+    peer = other_account(issuer)
+    peer_in: bool | None = None
+    try:
+        peer_in = await lookup_peer_in_chat(client, chat_id, peer)
+    except Exception:
+        logger.exception(
+            "mark-live form speaker lookup failed project=%r chat=%s",
+            project_name,
+            chat_id,
+        )
+        peer_in = None
+    if peer_in is None:
+        _titles, cache_roy, cache_josh = load_peer_folder_titles()
+        cached = chat_id in (cache_josh if peer == "josh" else cache_roy)
+        if cached:
+            peer_in = True
+        else:
+            logger.warning(
+                "mark-live form peer lookup unknown project=%r chat=%s peer=%s",
+                project_name,
+                chat_id,
+                peer,
+            )
+    speaker = live_form_speaker(issuer, peer_in_group=peer_in)
+    assign_form_sender(
+        path,
+        record_id,
+        speaker,
+        chat_id=chat_id,
+        project_name=project_name,
+        chat_title=chat_title,
+        requested_by=issuer,
+    )
+    roy_in: bool | None = True if issuer == "roy" else peer_in
+    josh_in: bool | None = True if issuer == "josh" else peer_in
+    remember_group_membership(
+        config,
+        rid=record_id,
+        project_name=project_name,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        roy_in=roy_in,
+        josh_in=josh_in,
+    )
+    logger.info(
+        "mark-live form speaker=%s issuer=%s peer_in=%s project=%r chat=%s",
+        speaker,
+        issuer,
+        peer_in,
+        project_name,
+        chat_id,
+    )
+    return speaker
+
+
+async def _apply_mark_live(
+    client: TelegramClient,
+    config: AppConfig,
+    *,
+    token: str,
+    record_id: str,
+    project_name: str,
+    fields: dict[str, Any],
+    chat_id: int,
+    chat_title: str,
+    scope: FolderScope | None = None,
+) -> str:
+    speaker = await _prepare_mark_live_form_speaker(
+        client,
+        config,
+        record_id=record_id,
+        project_name=project_name,
+        chat_id=chat_id,
+        chat_title=chat_title,
+    )
+    loop = asyncio.get_running_loop()
+    old_status = _field_text(fields, config.workflow_status_field)
+    new_status = config.workflow_trigger_status
+
+    if old_status == new_status:
+        logger.info(
+            "Mark-live skipped Lark update: project=%r record=%s already %r chat=%s",
+            project_name,
+            record_id,
+            new_status,
+            chat_id,
+        )
+        lines = [f"{project_name} is already live on mainnet."]
+    else:
+        try:
+            await loop.run_in_executor(
+                None,
+                update_record,
+                token,
+                config.workflow_base_app_token,
+                config.workflow_progress_table_id,
+                record_id,
+                {field_key(fields, config.workflow_status_field): new_status},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("mark_live: failed to update Lark status")
+            return f"Couldn't mark {project_name} live: {exc}"
+
+        logger.info(
+            "Marked live via TG: project=%r record=%s %r -> %r chat=%s",
+            project_name,
+            record_id,
+            old_status,
+            new_status,
+            chat_id,
+        )
+        lines = [f"{project_name} is live on BOT Chain mainnet now."]
+        try:
+            from bot.workflow_events import log_delivery
+
+            log_delivery(
+                "mark_live",
+                "telegram",
+                project_name=project_name,
+                record_id=record_id,
+                chat_id=chat_id,
+                text=(
+                    f"TG Mark live：进度表状态改为"
+                    f"{_english_status_label(new_status)}"
+                ),
+            )
+        except Exception:
+            pass
+
+    note = await _maybe_write_tg_chat_id(
+        loop,
+        token,
+        config,
+        record_id=record_id,
+        fields=fields,
+        chat_id=chat_id,
+    )
+    if note:
+        lines.append(note)
+
+    from bot.workflow_logo_fill import logo_fill_allowed
+
+    if config.workflow_mark_live_also_send_form or logo_fill_allowed(config):
+        # Never GetDialogs here: the operator is already in this group.
+        live_scope = scope if scope is not None else FolderScope(client, config)
+        outcome = await process_live_project(
+            client,
+            config,
+            live_scope,
+            record_id=record_id,
+            project_name=project_name,
+            require_live_status=True,
+            source="mark_live",
+            preferred_chat_id=chat_id,
+            preferred_chat_title=chat_title,
+        )
+        form = outcome.get("form")
+        if form == "sent":
+            lines.append("Onboarding form is in this group.")
+        elif form == "deferred" and speaker:
+            lines.append(
+                f"{_speaker_label(speaker)} will send the onboarding form in this group."
+            )
+        elif form == "already_sent":
+            lines.append("Onboarding form was already sent.")
+        elif form and str(form).startswith("no_group"):
+            lines.append("Marked live, but I couldn't match a Telegram group.")
+        elif form and form not in {"skipped", "no_form_url"}:
+            lines.append(f"Couldn't send the onboarding form ({form}).")
+
+        logo_status = str(outcome.get("logo") or "")
+        if logo_status.startswith("ok"):
+            lines.append("Logo is on the sheet.")
+        elif logo_status in {"already_has_logo", "already_processed", "baseline_has_logo"}:
+            lines.append("Logo is already on the sheet.")
+        elif logo_status in {"disabled", "skipped"}:
+            pass
+        else:
+            lines.append(f"Couldn't put the logo on the sheet ({logo_status}).")
+
+    return "\n".join(lines)
+
+
+def _collect_matches(
+    config: AppConfig,
+    records: list[dict[str, Any]],
+    chat_id: int,
+    chat_title: str,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Prefer exact TG chat id field matches; else fuzzy title matches."""
+    id_matches: list[tuple[str, str, dict[str, Any]]] = []
+    field = (config.workflow_tg_chat_id_field or "").strip()
+    if field:
+        for record in records:
+            record_id = str(record.get("record_id") or "")
+            fields = record.get("fields") or {}
+            project_name = _field_text(fields, config.workflow_project_name_field)
+            if not record_id or not project_name:
+                continue
+            stored = _parse_chat_id(_field_text(fields, field))
+            if stored == chat_id:
+                id_matches.append((record_id, project_name, fields))
+        if id_matches:
+            return id_matches
+
+    title_map = {chat_id: chat_title}
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for record in records:
+        record_id = str(record.get("record_id") or "")
+        fields = record.get("fields") or {}
+        project_name = _field_text(fields, config.workflow_project_name_field)
+        if not record_id or not project_name:
+            continue
+        matched, _reason = match_project_to_chat(project_name, title_map)
+        if matched == chat_id:
+            matches.append((record_id, project_name, fields))
+    return matches
+
+
+async def mark_live_from_group(
+    client: TelegramClient,
+    config: AppConfig,
+    chat_id: int,
+    chat_title: str,
+    scope: FolderScope | None = None,
+) -> MarkLiveOutcome:
+    """Match current TG group to a Lark project and set status to live."""
+    app_id = os.getenv("LARK_APP_ID", "").strip()
+    app_secret = os.getenv("LARK_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return MarkLiveOutcome("Missing LARK_APP_ID / LARK_APP_SECRET in .env")
+
+    if not chat_title.strip():
+        return MarkLiveOutcome("Cannot resolve this group title.")
+
+    loop = asyncio.get_running_loop()
+    try:
+        token = await loop.run_in_executor(None, get_tenant_access_token, app_id, app_secret)
+        records = await loop.run_in_executor(
+            None,
+            list_records,
+            token,
+            config.workflow_base_app_token,
+            config.workflow_progress_table_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("mark_live: failed to load Lark records")
+        return MarkLiveOutcome(f"Failed to read Lark: {exc}")
+
+    matches = _collect_matches(config, records, chat_id, chat_title)
+
+    if not matches:
+        return MarkLiveOutcome(
+            f"No Lark project matched this group title ({chat_title!r}). "
+            "Align Progress Tracker project name with the TG group name."
+        )
+    if len(matches) > 1:
+        candidates = [(rid, name) for rid, name, _fields in matches]
+        return MarkLiveOutcome(_ambiguous_text(candidates), candidates=candidates)
+
+    record_id, project_name, fields = matches[0]
+    if live_site_missing(config, fields):
+        logger.info(
+            "Mark-live blocked: empty live site project=%r record=%s chat=%s",
+            project_name,
+            record_id,
+            chat_id,
+        )
+        return MarkLiveOutcome(
+            MISSING_SITE_REMINDER,
+            need_site=(record_id, project_name),
+        )
+    text = await _apply_mark_live(
+        client,
+        config,
+        token=token,
+        record_id=record_id,
+        project_name=project_name,
+        fields=fields,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        scope=scope,
+    )
+    return MarkLiveOutcome(text)
+
+
+async def resolve_mark_live_reply(
+    client: TelegramClient,
+    config: AppConfig,
+    *,
+    chat_id: int,
+    chat_title: str,
+    quoted_msg_id: int,
+    picked_text: str,
+    scope: FolderScope | None = None,
+) -> MarkLiveOutcome | None:
+    """If quote targets an ambiguous mark-live prompt, continue with picked name.
+
+    Returns an outcome when handled, or None when this is not a pending prompt.
+    """
+    pending = peek_mark_live_pending(chat_id, quoted_msg_id)
+    if pending is None:
+        return None
+
+    raw_candidates = pending.get("candidates") or []
+    candidates: list[tuple[str, str]] = []
+    for item in raw_candidates:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get("record_id") or "").strip()
+        name = str(item.get("project_name") or "").strip()
+        if rid and name:
+            candidates.append((rid, name))
+    if not candidates:
+        pop_mark_live_pending(chat_id, quoted_msg_id)
+        return MarkLiveOutcome(
+            "Ambiguous mark-live prompt expired or empty. Run mark live again."
+        )
+
+    picked = (picked_text or "").strip()
+    if not picked:
+        return MarkLiveOutcome(
+            "Reply with the exact project name, e.g. "
+            + (candidates[0][1] if candidates else "Project Name")
+        )
+
+    choice = _pick_candidate(picked, candidates)
+    if choice is None:
+        names = ", ".join(name for _, name in candidates)
+        return MarkLiveOutcome(
+            f"No match for {picked!r} among: {names}.\n"
+            "Quote the Ambiguous message again and reply with the exact name."
+        )
+    if isinstance(choice, list):
+        names = ", ".join(name for _, name in choice)
+        return MarkLiveOutcome(
+            f"Still ambiguous ({len(choice)}): {names}.\n"
+            "Quote again and reply with the exact project name."
+        )
+
+    record_id, project_name = choice
+    # Consume pending only after a unique pick so typos can retry.
+    pop_mark_live_pending(chat_id, quoted_msg_id)
+
+    app_id = os.getenv("LARK_APP_ID", "").strip()
+    app_secret = os.getenv("LARK_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return MarkLiveOutcome("Missing LARK_APP_ID / LARK_APP_SECRET in .env")
+
+    loop = asyncio.get_running_loop()
+    try:
+        token = await loop.run_in_executor(None, get_tenant_access_token, app_id, app_secret)
+        records = await loop.run_in_executor(
+            None,
+            list_records,
+            token,
+            config.workflow_base_app_token,
+            config.workflow_progress_table_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("mark_live resolve: failed to load Lark records")
+        return MarkLiveOutcome(f"Failed to read Lark: {exc}")
+
+    fields: dict[str, Any] = {}
+    for record in records:
+        if str(record.get("record_id") or "") == record_id:
+            fields = record.get("fields") or {}
+            live_name = _field_text(fields, config.workflow_project_name_field)
+            if live_name:
+                project_name = live_name
+            break
+    else:
+        return MarkLiveOutcome(
+            f"Lark record {record_id} no longer found. Run mark live again."
+        )
+
+    title = (chat_title or "").strip() or str(pending.get("chat_title") or "")
+    if live_site_missing(config, fields):
+        logger.info(
+            "Mark-live resolve blocked: empty live site project=%r record=%s chat=%s",
+            project_name,
+            record_id,
+            chat_id,
+        )
+        return MarkLiveOutcome(
+            MISSING_SITE_REMINDER,
+            need_site=(record_id, project_name),
+        )
+
+    text = await _apply_mark_live(
+        client,
+        config,
+        token=token,
+        record_id=record_id,
+        project_name=project_name,
+        fields=fields,
+        chat_id=chat_id,
+        chat_title=title,
+        scope=scope,
+    )
+    return MarkLiveOutcome(text)
+
+
+def _site_url_from_reply(text: str) -> str:
+    from bot.workflow_live_link_sync import extract_http_site_url
+
+    return extract_http_site_url(text or "")
+
+
+async def resolve_mark_live_site_reply(
+    config: AppConfig,
+    *,
+    chat_id: int,
+    quoted_msg_id: int,
+    reply_text: str,
+) -> str | None:
+    """If quote targets a missing-website reminder, write 已上线链接.
+
+    Returns reply text when handled, or None when this is not a site pending.
+    """
+    pending = peek_mark_live_site_pending(chat_id, quoted_msg_id)
+    if pending is None:
+        return None
+
+    record_id = str(pending.get("record_id") or "").strip()
+    project_name = str(pending.get("project_name") or "").strip() or record_id
+    if not record_id:
+        pop_mark_live_site_pending(chat_id, quoted_msg_id)
+        return "Website prompt expired. Run mark live again."
+
+    url = _site_url_from_reply(reply_text)
+    if not url:
+        return (
+            "Please reply with the official site URL starting with http:// or https://.\n"
+            "Quote the website reminder again and paste the link."
+        )
+
+    live_field = str(
+        getattr(config, "workflow_live_link_field", "")
+        or "已上线链接🔗 Project Website URL"
+    ).strip()
+    app_id = os.getenv("LARK_APP_ID", "").strip()
+    app_secret = os.getenv("LARK_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return "Missing LARK_APP_ID / LARK_APP_SECRET in .env"
+
+    loop = asyncio.get_running_loop()
+    try:
+        token = await loop.run_in_executor(
+            None, get_tenant_access_token, app_id, app_secret
+        )
+        await loop.run_in_executor(
+            None,
+            update_record,
+            token,
+            config.workflow_base_app_token,
+            config.workflow_progress_table_id,
+            record_id,
+            {field_key({}, live_field): {"link": url, "text": url}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "mark_live site submit failed project=%r record=%s",
+            project_name,
+            record_id,
+        )
+        return f"Couldn't save the website for {project_name}: {exc}"
+
+    pop_mark_live_site_pending(chat_id, quoted_msg_id)
+    logger.info(
+        "mark_live site submitted project=%r record=%s url=%s",
+        project_name,
+        record_id,
+        url[:100],
+    )
+    return (
+        f"Website saved for {project_name}.\n"
+        f"`{url}`\n"
+        "Run mark live again to continue."
+    )

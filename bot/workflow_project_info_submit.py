@@ -1,0 +1,745 @@
+"""Reply to a verification result and paste a link.
+
+A profile URL (no ``/status/``) and a 40-hex contract go to the wallet table.
+A tweet URL goes to the progress-tracker KPI 2 field and is not treated as
+the official profile. Other http(s) URLs go to progress「已上线链接」so KPI 3
+probes the site the BD just pasted. A missing wallet row is created only when
+a profile or a contract was sent.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from bot.lark_bitable import create_record, get_tenant_access_token, list_records, update_record
+from bot.workflow_form_dispatch import _field_text, _normalize_name, field_key, field_raw
+from bot.workflow_kpi1_twitter import _RESERVED_HANDLES, twitter_handle_from_url
+from bot.workflow_lark_relay import claim_message, unclaim_message
+from bot.workflow_pr_capture import (
+    _display_pr_url,
+    collect_urls_from_text,
+    is_tweet_url,
+    kpi2_pass_fields,
+)
+from bot.workflow_tech_support import _extract_text_from_lark_content, _lark_creds
+
+logger = logging.getLogger(__name__)
+
+_CMD_RE = re.compile(
+    r"(?is)^\s*(?:@_user_\d+\s*)*(?:[/@])?project\s+info\s+submit\b(.*)$"
+)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
+# Exactly 40 hex digits. A 64-hex transaction hash must not match.
+_CONTRACT_RE = re.compile(r"(?<![0-9a-fA-F])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])")
+_NAME_FIELD = "Project name"
+_CONTRACT_FIELD = "Mainnet Contract Addresss"
+_TWITTER_FIELD = "Link of Project X ( Formerly Twitter) Profile Page"
+_DEFAULT_PROGRESS_NAME = "项目名称 Project Name"
+_DEFAULT_KPI2_FIELD = "KPI 2 - PR Announcement"
+_DEFAULT_LIVE_LINK_FIELD = "已上线链接🔗 Project Website URL"
+_FINAL_FAIL_COORDS = frozenset({"不通过", "KPI未通过"})
+# When BD submits before first check (or while not held), explain the gate.
+_EARLY_FINAL_ONLY_HELD_NOTICE = (
+    "手动提交信息触发终审，仅适用于一审结果为「暂扣整改」的项目。"
+    "一审尚未完成时提交，不会触发终审，请等待一审结果。\n"
+    "Manually submitting info to trigger a final review is only available when "
+    "the first check result is Held for rectification. Submitting before the "
+    "first check will not start a final review — please wait for the first-check result."
+)
+_EARLY_FINAL_FAILED_NOTICE = (
+    "信息已写入，但自动终审未完成，请联系审核号重试。\n"
+    "Info was saved, but the automatic final review did not finish. "
+    "Ask the review account to retry."
+)
+_EARLY_FINAL_PROGRESS_MISSING_NOTICE = (
+    "信息已写入，但进度表找不到对应项目，无法自动终审。\n"
+    "Info was saved, but no matching progress row was found for an automatic final review."
+)
+_RESULT_KPI_FAILED_RE = re.compile(
+    r"(?im)^\s*Result:\s*KPI failed\b"
+)
+_SITE_URL_BLOCK_HOSTS = frozenset(
+    {
+        "t.me",
+        "telegram.me",
+        "telegram.org",
+        "docs.google.com",
+        "drive.google.com",
+        "linkedin.com",
+        "www.linkedin.com",
+        "scan.botchain.ai",
+        "logo.clearbit.com",
+    }
+)
+
+
+def is_project_info_submit(text: str) -> bool:
+    return bool(_CMD_RE.match((text or "").strip()))
+
+
+def strip_command(text: str) -> str:
+    match = _CMD_RE.match((text or "").strip())
+    if not match:
+        return (text or "").strip()
+    return str(match.group(1) or "").strip()
+
+
+def clean_project_label(raw: str) -> str:
+    text = (raw or "").strip().strip("*` ").strip()
+    linked = _MD_LINK_RE.fullmatch(text)
+    if linked:
+        return (linked.group(1) or "").strip()
+    return text
+
+
+def project_name_from_quoted(text: str) -> str:
+    raw = text or ""
+    for line in raw.splitlines():
+        plain = line.replace("*", "").strip()
+        if plain.lower().startswith("project:"):
+            return clean_project_label(plain.split(":", 1)[1])
+    # A markdown post can come back as one block, with the label still bold.
+    plain = raw.replace("*", "")
+    match = re.search(r"(?i)\bproject:\s*`?([^\n`]+)", plain)
+    if not match:
+        return ""
+    label = match.group(1).strip()
+    label = re.split(r"\s{2,}|\s+(?:BD|Live date|First check|Result):", label, maxsplit=1)[0]
+    return clean_project_label(label)
+
+
+def _submitted_contracts(text: str) -> list[str]:
+    """Every 40-hex address, in order. A 64-hex hash is not a contract."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _CONTRACT_RE.finditer(text or ""):
+        addr = match.group(0).lower()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        out.append(addr)
+    return out
+
+
+def _is_site_submit_url(url: str) -> bool:
+    """True for an official-site URL (not X / TG / explorer / drive)."""
+    from urllib.parse import urlparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    if is_tweet_url(raw):
+        return False
+    if twitter_handle_from_url(raw):
+        return False
+    try:
+        host = (urlparse(raw).netloc or "").lower()
+    except ValueError:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or host in _SITE_URL_BLOCK_HOSTS:
+        return False
+    if host.endswith(".google.com"):
+        return False
+    path = (urlparse(raw).path or "").lower()
+    if host == "scan.botchain.ai" or "/tx/" in path or "/address/" in path:
+        return False
+    return True
+
+
+def parse_submit_payload(text: str) -> tuple[str, str, str, str]:
+    """Return (contract, twitter_profile_url, pr_url, site_url). Empty when missing.
+
+    ``/status/`` URLs are PR links. A profile URL has no status segment.
+    Other http(s) URLs are treated as the official site for「已上线链接」.
+    Bare ``@name`` mentions are ignored. A transaction hash (64 hex digits)
+    is not a contract. Several 40-hex addresses are kept, one per line.
+    """
+    blob = _MD_LINK_RE.sub(lambda match: match.group(2), text or "")
+    contract = "\n".join(_submitted_contracts(blob))
+    twitter = ""
+    pr = ""
+    site = ""
+    for url in collect_urls_from_text(blob):
+        if is_tweet_url(url):
+            if not pr:
+                pr = _display_pr_url(url)
+            continue
+        handle = twitter_handle_from_url(url)
+        if handle and handle.lower() not in _RESERVED_HANDLES:
+            if not twitter:
+                twitter = f"https://x.com/{handle}"
+            continue
+        if not site and _is_site_submit_url(url):
+            site = url
+    return contract, twitter, pr, site
+
+
+def _expected_chat_id(config: Any) -> str:
+    raw = getattr(config, "raw", {}) or {}
+    workflow = raw.get("workflow") if isinstance(raw, dict) else {}
+    block = (workflow or {}).get("project_info_submit") or {}
+    if isinstance(block, dict):
+        custom = str(block.get("lark_chat_id") or "").strip()
+        if custom:
+            return custom
+    return str(getattr(config, "workflow_live_onboard_lark_chat_id", "") or "").strip()
+
+
+def _enabled(config: Any) -> bool:
+    raw = getattr(config, "raw", {}) or {}
+    workflow = raw.get("workflow") if isinstance(raw, dict) else {}
+    block = (workflow or {}).get("project_info_submit") or {}
+    if isinstance(block, dict) and "enabled" in block:
+        return bool(block.get("enabled"))
+    return True
+
+
+def message_text(message: dict[str, Any]) -> str:
+    msg_type = str(message.get("message_type") or message.get("msg_type") or "text")
+    raw = message.get("content")
+    if raw is None:
+        body = message.get("body") or {}
+        raw = body.get("content") if isinstance(body, dict) else ""
+    if isinstance(raw, dict):
+        import json
+
+        raw = json.dumps(raw, ensure_ascii=False)
+    return _extract_text_from_lark_content(msg_type, str(raw or ""))
+
+
+def _name_hits(
+    rows: list[dict[str, Any]], project_name: str, name_field: str
+) -> list[tuple[str, dict[str, Any]]]:
+    key = _normalize_name(project_name)
+    hits: list[tuple[str, dict[str, Any]]] = []
+    for row in rows:
+        rid = str(row.get("record_id") or "")
+        fields = row.get("fields") or {}
+        if not rid or not isinstance(fields, dict):
+            continue
+        if _normalize_name(_field_text(fields, name_field)) != key:
+            continue
+        hits.append((rid, fields))
+    return hits
+
+
+def upsert_wallet_row(
+    token: str,
+    config: Any,
+    *,
+    project_name: str,
+    contract: str,
+    twitter: str,
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    app_token = str(getattr(config, "workflow_base_app_token", "") or "").strip()
+    table_id = str(getattr(config, "workflow_wallet_table_id", "") or "").strip()
+    name_field = str(
+        getattr(config, "workflow_wallet_name_field", "") or _NAME_FIELD
+    ).strip()
+    if not app_token or not table_id:
+        return {"ok": False, "reason": "wallet_table_not_configured"}
+    if not contract and not twitter:
+        return {"ok": True, "action": "skipped", "project": project_name, "record_ids": []}
+    if rows is None:
+        rows = list_records(token, app_token, table_id)
+    hits = _name_hits(rows, project_name, name_field)
+    payload: dict[str, str] = {}
+    if contract:
+        payload[_CONTRACT_FIELD] = contract
+    if twitter:
+        payload[_TWITTER_FIELD] = twitter
+    if not hits:
+        created = create_record(
+            token,
+            app_token,
+            table_id,
+            {name_field: project_name, **payload},
+        )
+        logger.info(
+            "project info submit created wallet project=%r record=%s",
+            project_name,
+            created,
+        )
+        return {
+            "ok": True,
+            "action": "created",
+            "project": project_name,
+            "record_ids": [created],
+            "contract": contract,
+            "twitter": twitter,
+        }
+    updated: list[str] = []
+    for rid, _fields in hits:
+        update_record(token, app_token, table_id, rid, payload)
+        updated.append(rid)
+    logger.info(
+        "project info submit updated wallet project=%r n=%s",
+        project_name,
+        len(updated),
+    )
+    return {
+        "ok": True,
+        "action": "updated",
+        "project": project_name,
+        "record_ids": updated,
+        "contract": contract,
+        "twitter": twitter,
+        "duplicate_rows": len(updated) > 1,
+    }
+
+
+def write_pr_link(
+    token: str,
+    config: Any,
+    *,
+    project_name: str,
+    pr_url: str,
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    from bot.workflow_kpi_write import is_kpi_era_live, kpi_checks_on_this_host
+
+    if not kpi_checks_on_this_host():
+        return {
+            "ok": True,
+            "action": "skipped_non_roy",
+            "project": project_name,
+            "record_ids": [],
+        }
+    if not pr_url:
+        return {"ok": True, "action": "skipped", "project": project_name, "record_ids": []}
+    app_token = str(getattr(config, "workflow_base_app_token", "") or "").strip()
+    table_id = str(getattr(config, "workflow_progress_table_id", "") or "").strip()
+    name_field = str(
+        getattr(config, "workflow_project_name_field", "") or _DEFAULT_PROGRESS_NAME
+    ).strip()
+    link_field = str(
+        getattr(config, "pr_capture_link_field", "") or _DEFAULT_KPI2_FIELD
+    ).strip()
+    if not app_token or not table_id or not link_field:
+        return {"ok": False, "reason": "progress_table_not_configured", "project": project_name}
+    if rows is None:
+        rows = list_records(token, app_token, table_id)
+    hits = [
+        (rid, fields)
+        for rid, fields in _name_hits(rows, project_name, name_field)
+        if is_kpi_era_live(fields)
+    ]
+    if not hits:
+        return {"ok": False, "reason": "progress_missing", "project": project_name, "pr": pr_url}
+    updated: list[str] = []
+    fields = kpi2_pass_fields(link_field=link_field, url=pr_url)
+    for rid, _row_fields in hits:
+        update_record(token, app_token, table_id, rid, fields)
+        updated.append(rid)
+    logger.info(
+        "project info submit wrote PR project=%r n=%s", project_name, len(updated)
+    )
+    return {
+        "ok": True,
+        "action": "updated",
+        "project": project_name,
+        "record_ids": updated,
+        "pr": pr_url,
+        "duplicate_rows": len(updated) > 1,
+    }
+
+
+def write_live_site_url(
+    token: str,
+    config: Any,
+    *,
+    project_name: str,
+    site_url: str,
+    rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write a pasted official site into progress「已上线链接」before KPI 3."""
+    from bot.workflow_kpi_write import is_kpi_era_live, kpi_checks_on_this_host
+
+    if not kpi_checks_on_this_host():
+        return {
+            "ok": True,
+            "action": "skipped_non_roy",
+            "project": project_name,
+            "record_ids": [],
+        }
+    site = (site_url or "").strip()
+    if not site:
+        return {"ok": True, "action": "skipped", "project": project_name, "record_ids": []}
+    app_token = str(getattr(config, "workflow_base_app_token", "") or "").strip()
+    table_id = str(getattr(config, "workflow_progress_table_id", "") or "").strip()
+    name_field = str(
+        getattr(config, "workflow_project_name_field", "") or _DEFAULT_PROGRESS_NAME
+    ).strip()
+    live_field = str(
+        getattr(config, "workflow_live_link_field", "") or _DEFAULT_LIVE_LINK_FIELD
+    ).strip()
+    if not app_token or not table_id or not live_field:
+        return {
+            "ok": False,
+            "reason": "progress_table_not_configured",
+            "project": project_name,
+        }
+    if rows is None:
+        rows = list_records(token, app_token, table_id)
+    hits = [
+        (rid, fields)
+        for rid, fields in _name_hits(rows, project_name, name_field)
+        if is_kpi_era_live(fields)
+    ]
+    if not hits:
+        return {
+            "ok": False,
+            "reason": "progress_missing",
+            "project": project_name,
+            "site": site,
+        }
+    updated: list[str] = []
+    for rid, row_fields in hits:
+        payload = {field_key(row_fields, live_field): {"link": site, "text": site}}
+        update_record(token, app_token, table_id, rid, payload)
+        updated.append(rid)
+    logger.info(
+        "project info submit wrote live site project=%r url=%s n=%s",
+        project_name,
+        site[:80],
+        len(updated),
+    )
+    return {
+        "ok": True,
+        "action": "updated",
+        "project": project_name,
+        "record_ids": updated,
+        "site": site,
+        "duplicate_rows": len(updated) > 1,
+    }
+
+
+def quoted_result_is_kpi_failed(text: str) -> bool:
+    """True when the quoted result post already shows Result: KPI failed."""
+    plain = (text or "").replace("*", "").replace("`", "")
+    return bool(_RESULT_KPI_FAILED_RE.search(plain))
+
+
+def progress_coord_is_final_failed(
+    token: str,
+    config: Any,
+    *,
+    project_name: str,
+    quoted: str = "",
+) -> bool:
+    """True when the KPI-era progress row is already final-failed.
+
+    Progress ``KPI Final`` is the source of truth. If no row is found, fall
+    back to the quoted result post text.
+    """
+    from bot.workflow_kpi_result_push import pick_early_final_progress_row
+
+    app_token = str(getattr(config, "workflow_base_app_token", "") or "").strip()
+    table_id = str(getattr(config, "workflow_progress_table_id", "") or "").strip()
+    name_field = str(
+        getattr(config, "workflow_project_name_field", "") or _DEFAULT_PROGRESS_NAME
+    ).strip()
+    if app_token and table_id and (project_name or "").strip():
+        try:
+            rows = list_records(token, app_token, table_id)
+            hit = pick_early_final_progress_row(
+                rows,
+                project_name=project_name,
+                name_field=name_field,
+            )
+        except Exception:
+            logger.exception(
+                "project info submit final-fail lookup failed project=%r",
+                project_name,
+            )
+            hit = None
+        if hit:
+            coord = _field_text(hit.get("fields") or {}, "KPI Final").strip()
+            return coord in _FINAL_FAIL_COORDS
+    return quoted_result_is_kpi_failed(quoted)
+
+
+def early_final_skip_notice(reason: str) -> str:
+    """Bilingual notice when submit wrote data but final did not run."""
+    key = str(reason or "").strip()
+    if key.startswith("not_held"):
+        return _EARLY_FINAL_ONLY_HELD_NOTICE
+    if key == "progress_missing":
+        return _EARLY_FINAL_PROGRESS_MISSING_NOTICE
+    if key in {
+        "audit_or_send_failed",
+        "list_failed",
+        "missing_lark_credentials",
+        "non_roy_host",
+        "no_project",
+        "",
+    }:
+        return _EARLY_FINAL_FAILED_NOTICE
+    return _EARLY_FINAL_FAILED_NOTICE
+
+
+def format_submit_reply(
+    *,
+    project: str,
+    wallet: dict[str, Any] | None = None,
+    pr: dict[str, Any] | None = None,
+    site: dict[str, Any] | None = None,
+    reason: str = "",
+) -> str:
+    if reason == "no_quote":
+        return "Reply to the project result post and paste the link."
+    if reason == "no_project":
+        return "Quoted message has no **Project:** line, so nothing was written."
+    if reason == "final_failed":
+        return (
+            "Second check already failed for this project. "
+            "No further submit or review.\n"
+            "该项目二审已不通过，无法再次补交或审核。"
+        )
+    if reason == "empty_payload":
+        return (
+            "Paste the X profile, the mainnet contract (0x plus 40 hex digits), "
+            "the official website URL, or the PR tweet link."
+        )
+    name = project or "this project"
+    lines: list[str] = []
+    wallet = wallet or {}
+    pr = pr or {}
+    site = site or {}
+    if wallet.get("action") == "created":
+        lines.append(f"Created info form row for {name}.")
+    elif wallet.get("action") == "updated":
+        lines.append(f"Updated info form row for {name}.")
+    elif wallet.get("reason"):
+        lines.append(f"{name}: info form write failed ({wallet['reason']}).")
+    if wallet.get("twitter"):
+        lines.append(f"Twitter: {wallet['twitter']}")
+    for addr in str(wallet.get("contract") or "").splitlines():
+        if addr.strip():
+            lines.append(f"Contract: {addr.strip()}")
+    if wallet.get("duplicate_rows"):
+        count = len(wallet.get("record_ids") or [])
+        lines.append(
+            f"Note: {count} info form rows share this name. "
+            "Merge them later so KPI checks can match."
+        )
+    if site.get("ok") and site.get("action") == "updated":
+        lines.append("Website submitted successfully.")
+        if site.get("site"):
+            lines.append(str(site["site"]))
+        if site.get("duplicate_rows"):
+            count = len(site.get("record_ids") or [])
+            lines.append(f"Note: {count} progress rows share this name.")
+    elif site.get("reason") == "progress_missing":
+        lines.append(f"Website submit failed: no progress row for {name}.")
+    elif site.get("reason"):
+        lines.append(f"Website submit failed ({site['reason']}).")
+    if pr.get("ok") and pr.get("action") == "updated":
+        lines.append("PR written to KPI 2.")
+        if pr.get("pr"):
+            lines.append(str(pr["pr"]))
+        if pr.get("duplicate_rows"):
+            count = len(pr.get("record_ids") or [])
+            lines.append(f"Note: {count} progress rows share this name.")
+    elif pr.get("reason") == "progress_missing":
+        lines.append(f"PR was not written: no progress row for {name}.")
+    elif pr.get("reason"):
+        lines.append(f"PR was not written ({pr['reason']}).")
+    if not lines:
+        return f"{name}: nothing was written."
+    return "\n".join(lines)
+
+
+def _reply(token: str, message_id: str, text: str) -> None:
+    from bot.workflow_lark_bridge import _reply_to_message
+
+    _reply_to_message(token, message_id, text)
+
+
+def maybe_handle_project_info_submit(
+    config: Any, event_data: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Write links pasted in a reply to a verification result. None = ignore."""
+    from bot.workflow_kpi_write import kpi_checks_on_this_host
+
+    if not kpi_checks_on_this_host():
+        return None
+    if not _enabled(config):
+        return None
+    if not isinstance(event_data, dict):
+        return None
+    message = event_data.get("message") or {}
+    sender = event_data.get("sender") or {}
+    if not isinstance(message, dict):
+        return None
+    if str(sender.get("sender_type") or "").lower() == "app":
+        return None
+    expected = _expected_chat_id(config)
+    chat_id = str(message.get("chat_id") or "").strip()
+    if not expected or chat_id != expected:
+        return None
+    text = message_text(message)
+    payload_text = strip_command(text) if is_project_info_submit(text) else text
+    contract, twitter, pr_url, site_url = parse_submit_payload(payload_text)
+    if not contract and not twitter and not pr_url and not site_url:
+        return None
+
+    from bot.lark_bitable import LarkBitableError
+    from bot.workflow_lark_recall import get_message
+
+    message_id = str(message.get("message_id") or "")
+    if not claim_message(message_id):
+        return {"ok": True, "project_info_submit": "duplicate"}
+
+    app_id, app_secret = _lark_creds(config)
+    if not app_id or not app_secret:
+        logger.error("project info submit missing Lark credentials")
+        return {"ok": False, "project_info_submit": "no_credentials"}
+    try:
+        token = get_tenant_access_token(app_id, app_secret)
+    except Exception:
+        logger.exception("project info submit token failed")
+        return {"ok": False, "project_info_submit": "token_failed"}
+
+    parent_id = str(message.get("parent_id") or message.get("root_id") or "").strip()
+    if not parent_id:
+        _reply(token, message_id, format_submit_reply(project="", reason="no_quote"))
+        return {"ok": True, "project_info_submit": "no_quote"}
+
+    try:
+        parent = get_message(token, parent_id) or {}
+    except Exception:
+        logger.exception("project info submit get parent failed")
+        _reply(token, message_id, "Could not read the quoted result post. Try again.")
+        return {"ok": False, "project_info_submit": "parent_missing"}
+
+    quoted = message_text(parent if isinstance(parent, dict) else {})
+    project = project_name_from_quoted(quoted)
+    if not project:
+        _reply(token, message_id, format_submit_reply(project="", reason="no_project"))
+        return {"ok": True, "project_info_submit": "no_project"}
+
+    if progress_coord_is_final_failed(
+        token, config, project_name=project, quoted=quoted
+    ):
+        reply = format_submit_reply(project=project, reason="final_failed")
+        _reply(token, message_id, reply)
+        logger.info(
+            "project info submit rejected final-failed project=%r", project
+        )
+        return {
+            "ok": True,
+            "project_info_submit": "final_failed",
+            "project": project,
+        }
+
+    wallet: dict[str, Any] = {"ok": True, "action": "skipped"}
+    pr: dict[str, Any] = {"ok": True, "action": "skipped"}
+    site: dict[str, Any] = {"ok": True, "action": "skipped"}
+    try:
+        if contract or twitter:
+            wallet = upsert_wallet_row(
+                token,
+                config,
+                project_name=project,
+                contract=contract,
+                twitter=twitter,
+            )
+        # Write the live site before PR / early final so KPI 3 probes the
+        # URL the BD just pasted (e.g. vercel app vs marketing domain).
+        if site_url:
+            site = write_live_site_url(
+                token, config, project_name=project, site_url=site_url
+            )
+        if pr_url:
+            pr = write_pr_link(token, config, project_name=project, pr_url=pr_url)
+    except LarkBitableError:
+        logger.exception("project info submit write failed project=%r", project)
+        _reply(token, message_id, f"{project}: table write failed.")
+        return {"ok": False, "project_info_submit": "write_failed"}
+
+    if pr.get("ok") and pr.get("action") == "updated":
+        try:
+            from bot.workflow_pr_weekly import log_capture_event
+
+            for rid in pr.get("record_ids") or []:
+                log_capture_event(
+                    config,
+                    record_id=str(rid),
+                    project=project,
+                    url=str(pr.get("pr") or pr_url),
+                )
+        except Exception:
+            logger.exception("project info submit failed to log PR event")
+
+    reply = format_submit_reply(project=project, wallet=wallet, pr=pr, site=site)
+    wrote = (
+        wallet.get("action") in {"created", "updated"}
+        or (pr.get("ok") and pr.get("action") == "updated")
+        or (site.get("ok") and site.get("action") == "updated")
+    )
+    early: dict[str, Any] = {"ran": False}
+    if wrote:
+        try:
+            from bot.workflow_kpi_result_push import run_early_final_after_submit
+
+            progress_rid = ""
+            for rid in list(pr.get("record_ids") or []) + list(
+                site.get("record_ids") or []
+            ):
+                if str(rid).strip():
+                    progress_rid = str(rid).strip()
+                    break
+            early = run_early_final_after_submit(
+                config, project_name=project, record_id=progress_rid
+            )
+            if early.get("ran"):
+                reply = (
+                    f"{reply}\nFinal review posted: {early.get('result') or 'done'}."
+                )
+            else:
+                reason = str(early.get("reason") or "")
+                notice = early_final_skip_notice(reason)
+                if notice:
+                    reply = f"{reply}\n{notice}"
+                logger.info(
+                    "project info submit early final skipped project=%r reason=%s",
+                    project,
+                    reason or "unknown",
+                )
+                # not_held is intentional; other failures must be retryable.
+                if not reason.startswith("not_held"):
+                    unclaim_message(message_id)
+        except Exception:
+            logger.exception(
+                "project info submit early final crashed project=%r", project
+            )
+            reply = f"{reply}\n{_EARLY_FINAL_FAILED_NOTICE}"
+            early = {"ran": False, "reason": "crashed"}
+            unclaim_message(message_id)
+    _reply(token, message_id, reply)
+    try:
+        from bot.workflow_events import log_delivery
+
+        log_delivery(
+            "project_info_submit",
+            "Project info submit",
+            project_name=project,
+            text=reply.replace("\n", " · "),
+            record_id=(wallet.get("record_ids") or pr.get("record_ids") or [""])[0],
+        )
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "project_info_submit": "done",
+        "project": project,
+        "wallet": wallet.get("action"),
+        "pr": pr.get("action") if pr.get("ok") else pr.get("reason"),
+        "early_final": early.get("reason") if early else "",
+    }

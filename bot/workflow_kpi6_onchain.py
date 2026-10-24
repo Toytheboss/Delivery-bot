@@ -1,0 +1,402 @@
+"""KPI 6 on-chain check: unique wallets and successful core txs."""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+import requests
+
+from bot.lark_bitable import update_record
+from bot.workflow_form_dispatch import _field_text
+from bot.workflow_kpi_write import (
+    SH,
+    field_result,
+    find_wallet_row,
+    merge_kpi_copy,
+    merge_kpi_result,
+    now_shanghai,
+    wallet_contracts,
+)
+
+if TYPE_CHECKING:
+    from bot.config_loader import AppConfig
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_COPY_FIELD = "KPI 6 - On chain interaction"
+_DEFAULT_RESULT_FIELD = "Onchain result"
+_PASS = "通过"
+_FAIL = "不通过"
+_SCAN_API = "https://scan.botchain.ai/api"
+_WALLET_SHOW = 3
+_TX_SHOW = 5
+_MIN_WALLETS = 3
+_MIN_TXS = 5
+# Newest-first small pages: stop once KPI thresholds are met so busy
+# contracts (DEX etc.) do not pull tens of thousands of historical txs.
+_PAGE_SIZE = 100
+_MAX_PAGES = 30
+_PAGE_TIMEOUT = 30
+_PAGE_RETRIES = 3
+_MEETS_AUDIT = "Meets the audit requirement"
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def is_create_tx(tx: dict[str, Any]) -> bool:
+    if str(tx.get("contractAddress") or "").strip():
+        return True
+    to_addr = str(tx.get("to") or "").strip()
+    return not to_addr
+
+
+def is_successful(tx: dict[str, Any]) -> bool:
+    err = str(tx.get("isError") or "0").strip()
+    return err in {"", "0"}
+
+
+def _kpi6_thresholds_met(core: list[dict[str, Any]], contract: str) -> bool:
+    wallets = unique_wallets(core, contract)
+    return len(wallets) >= _MIN_WALLETS and len(core) >= _MIN_TXS
+
+
+def _fetch_txlist_page(address: str, *, page: int) -> list[dict[str, Any]]:
+    """One scanner page with retries. Newest-first, small offset."""
+    last_exc: Exception | None = None
+    for attempt in range(_PAGE_RETRIES):
+        try:
+            resp = requests.get(
+                _SCAN_API,
+                params={
+                    "module": "account",
+                    "action": "txlist",
+                    "address": address,
+                    "startblock": 0,
+                    "endblock": 99999999,
+                    "page": page,
+                    "offset": _PAGE_SIZE,
+                    "sort": "desc",
+                },
+                headers={"User-Agent": _UA},
+                timeout=_PAGE_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = payload.get("result") if isinstance(payload, dict) else None
+            if not isinstance(rows, list) or not rows:
+                return []
+            return [row for row in rows if isinstance(row, dict)]
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
+            logger.info(
+                "kpi6: txlist page retry address=%s page=%s attempt=%s err=%s",
+                (address or "")[:12],
+                page,
+                attempt + 1,
+                str(exc)[:120],
+            )
+            time.sleep(0.4 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
+def fetch_txlist(address: str) -> list[dict[str, Any]]:
+    """Pull newest txs until KPI 6 thresholds are met (or pages run out).
+
+    Busy contracts can have tens of thousands of historical txs; we only need
+    ≥3 unique wallets and ≥5 successful core txs, so stop as soon as that is
+    satisfied instead of scanning from genesis.
+    """
+    ca = (address or "").strip()
+    if not ca:
+        return []
+    items: list[dict[str, Any]] = []
+    page = 1
+    while page <= _MAX_PAGES:
+        rows = _fetch_txlist_page(ca, page=page)
+        if not rows:
+            break
+        items.extend(rows)
+        core, _skipped = classify_core_txs(items, contract=ca, window_start=None)
+        if _kpi6_thresholds_met(core, ca):
+            break
+        if len(rows) < _PAGE_SIZE:
+            break
+        page += 1
+    return items
+
+
+def classify_core_txs(
+    txs: list[dict[str, Any]],
+    *,
+    contract: str,
+    window_start: datetime | None,
+    window_end: datetime | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    ca = (contract or "").lower()
+    end = window_end or now_shanghai()
+    core: list[dict[str, Any]] = []
+    skipped = {"create": 0, "failed": 0, "out_window": 0, "not_to": 0}
+    for tx in txs:
+        to_addr = str(tx.get("to") or "").strip().lower()
+        if is_create_tx(tx):
+            skipped["create"] += 1
+            continue
+        if to_addr != ca:
+            skipped["not_to"] += 1
+            continue
+        if not is_successful(tx):
+            skipped["failed"] += 1
+            continue
+        try:
+            ts = datetime.fromtimestamp(int(tx.get("timeStamp") or 0), SH)
+        except (OSError, OverflowError, TypeError, ValueError):
+            skipped["out_window"] += 1
+            continue
+        if window_start is not None and ts < window_start:
+            skipped["out_window"] += 1
+            continue
+        if ts > end:
+            skipped["out_window"] += 1
+            continue
+        core.append(tx)
+    return core, skipped
+
+
+def unique_wallets(txs: list[dict[str, Any]], contract: str) -> list[str]:
+    ca = (contract or "").lower()
+    counts: dict[str, int] = {}
+    for tx in txs:
+        sender = str(tx.get("from") or "").strip().lower()
+        if not sender or sender == ca:
+            continue
+        counts[sender] = counts.get(sender, 0) + 1
+    return sorted(counts, key=lambda addr: (-counts[addr], addr))
+
+
+def core_tx_hashes(txs: list[dict[str, Any]]) -> list[str]:
+    ranked = sorted(
+        txs,
+        key=lambda tx: int(tx.get("timeStamp") or 0),
+        reverse=True,
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for tx in ranked:
+        raw = str(tx.get("hash") or tx.get("transactionHash") or "").strip()
+        if not raw:
+            continue
+        key = raw.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def build_kpi6_copy(
+    *,
+    passed: bool,
+    reason: str,
+    wallets: list[str],
+    tx_count: int,
+    hashes: list[str] | None = None,
+) -> str:
+    if reason == "no_contract":
+        return "- Contract: not submitted\n- Result: failed"
+    n = len(wallets)
+    lines = [
+        f"- Unique wallets: {n} (need ≥3)",
+        f"- Core txs: {tx_count} (need ≥5)",
+        f"- Result: {'passed' if passed else 'failed'}",
+    ]
+    # Cap evidence in both pass and fail copy so TG replies stay under length limits.
+    show_wallets = list(wallets[:_WALLET_SHOW])
+    show_hashes = list((hashes or [])[:_TX_SHOW])
+    if passed:
+        lines.append(f"- {_MEETS_AUDIT}")
+    if show_wallets:
+        lines.append("- Wallets:")
+        lines.extend(f"  {addr}" for addr in show_wallets)
+    if show_hashes:
+        lines.append("- Tx hashes:")
+        lines.extend(f"  {item}" for item in show_hashes)
+    return "\n".join(lines)
+
+
+def evaluate_kpi6_contracts(
+    *,
+    contracts: list[str],
+    txs_by_contract: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Combine core txs from every mainnet contract on the wallet row."""
+    addrs = []
+    seen: set[str] = set()
+    for raw in contracts or []:
+        addr = (raw or "").strip().lower()
+        if not addr or addr in seen:
+            continue
+        seen.add(addr)
+        addrs.append(addr)
+    if not addrs:
+        return evaluate_kpi6(contract="", txs=[])
+    if len(addrs) == 1:
+        rows = (txs_by_contract or {}).get(addrs[0])
+        return evaluate_kpi6(contract=addrs[0], txs=rows)
+    blocked = set(addrs)
+    core_all: list[dict[str, Any]] = []
+    for addr in addrs:
+        rows = (txs_by_contract or {}).get(addr) or []
+        core, _skipped = classify_core_txs(rows, contract=addr, window_start=None)
+        core_all.extend(core)
+    wallets = [w for w in unique_wallets(core_all, "") if w not in blocked]
+    hashes = core_tx_hashes(core_all)
+    tx_count = len(hashes)
+    passed = len(wallets) >= _MIN_WALLETS and tx_count >= _MIN_TXS
+    return {
+        "passed": passed,
+        "result": _PASS if passed else _FAIL,
+        "reason": "pass" if passed else "below_threshold",
+        "wallets": wallets,
+        "tx_count": tx_count,
+        "hashes": hashes,
+        "copy": build_kpi6_copy(
+            passed=passed,
+            reason="ok",
+            wallets=wallets,
+            tx_count=tx_count,
+            hashes=hashes,
+        ),
+    }
+
+
+def evaluate_kpi6(
+    *,
+    contract: str,
+    txs: list[dict[str, Any]] | None,
+    window_start: datetime | None = None,
+) -> dict[str, Any]:
+    if not contract:
+        return {
+            "passed": False,
+            "result": _FAIL,
+            "reason": "no_contract",
+            "wallets": [],
+            "tx_count": 0,
+            "copy": build_kpi6_copy(
+                passed=False, reason="no_contract", wallets=[], tx_count=0
+            ),
+            "hashes": [],
+        }
+    core, _skipped = classify_core_txs(
+        txs or [], contract=contract, window_start=None
+    )
+    wallets = unique_wallets(core, contract)
+    hashes = core_tx_hashes(core)
+    tx_count = len(core)
+    passed = len(wallets) >= _MIN_WALLETS and tx_count >= _MIN_TXS
+    return {
+        "passed": passed,
+        "result": _PASS if passed else _FAIL,
+        "reason": "pass" if passed else "below_threshold",
+        "wallets": wallets,
+        "tx_count": tx_count,
+        "hashes": hashes,
+        "copy": build_kpi6_copy(
+            passed=passed,
+            reason="ok",
+            wallets=wallets,
+            tx_count=tx_count,
+            hashes=hashes,
+        ),
+    }
+
+
+def audit_kpi6_for_fields(
+    token: str,
+    config: AppConfig,
+    record_id: str,
+    fields: dict[str, Any],
+    *,
+    project_name: str = "",
+) -> dict[str, Any]:
+    from bot.workflow_kpi_write import kpi_checks_on_this_host
+
+    if not kpi_checks_on_this_host():
+        return {
+            "result": "skipped_non_roy",
+            "passed": False,
+            "reason": "skipped_non_roy",
+            "copy": "",
+            "contract": "",
+            "wallets": 0,
+            "txs": 0,
+            "project": project_name,
+        }
+    rid = (record_id or "").strip()
+    name = (project_name or "").strip() or _field_text(
+        fields, config.workflow_project_name_field
+    )
+    copy_field = str(
+        getattr(config, "workflow_kpi6_copy_field", "") or _DEFAULT_COPY_FIELD
+    )
+    result_field = str(
+        getattr(config, "workflow_kpi6_result_field", "") or _DEFAULT_RESULT_FIELD
+    )
+    wallet = find_wallet_row(token, config, name)
+    contracts = wallet_contracts(wallet[1]) if wallet else []
+    txs_by_contract: dict[str, list[dict[str, Any]]] = {}
+    for addr in contracts:
+        txs_by_contract[addr] = fetch_txlist(addr)
+    verdict = evaluate_kpi6_contracts(
+        contracts=contracts, txs_by_contract=txs_by_contract
+    )
+    contract = "\n".join(contracts)
+    existing_copy = _field_text(fields, copy_field)
+    existing_result = field_result(fields, result_field)
+    copy = merge_kpi_copy(existing_copy, str(verdict["copy"]))
+    result = merge_kpi_result(existing_result, passed=bool(verdict["passed"]))
+    update_record(
+        token,
+        config.workflow_base_app_token,
+        config.workflow_progress_table_id,
+        rid,
+        {copy_field: copy, result_field: result},
+    )
+    try:
+        from bot.workflow_events import log_delivery
+
+        log_delivery(
+            "kpi_result_written",
+            "kpi6",
+            project_name=name,
+            record_id=rid,
+            text=f"进度表写入 KPI 6 链上交互：{result}",
+        )
+    except Exception:
+        pass
+    logger.info(
+        "kpi6: %s project=%r record=%s ca=%s wallets=%s txs=%s",
+        result,
+        name,
+        rid,
+        contract,
+        len(verdict["wallets"]),
+        verdict["tx_count"],
+    )
+    return {
+        "result": result,
+        "passed": result == _PASS,
+        "reason": verdict["reason"],
+        "copy": copy,
+        "contract": contract,
+        "wallets": len(verdict["wallets"]),
+        "txs": verdict["tx_count"],
+        "project": name,
+    }

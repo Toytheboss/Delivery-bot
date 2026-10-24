@@ -1,0 +1,305 @@
+# Delivery Agent 配置（复制为 config/config.yaml 后修改）
+
+scope:
+  # Telegram 左侧分组（可多个；每个 folder 约最多 100 个群）。
+  # 答疑、表单匹配、上线分案看的是号已加入的群，不要求群先在 folder 里。
+  folder_names:
+    - "Projects #1"
+    - "Projects #2"
+    - "Projects #3"
+  folder_name: "Projects #1"  # 兼容旧字段；实际以 folder_names 为准
+  # 自动把新群塞进 Telegram Folder。业务已不依赖 Folder，生产建议 false（省扫群/flood）
+  auto_add_enabled: false
+  # folder 满了后自动新建 Delivery #4 / #5 ...（仅 auto_add 开启时有意义）
+  auto_create_folders: false
+  folder_name_prefix: "Projects"
+  auto_add_keywords:
+    - "projects"
+    - "partner"
+  max_chats_per_folder: 100
+  # Backup catch-up only; join still uses ChatAction for instant folder add
+  auto_add_scan_minutes: 15
+  # 最后一条消息在这天或更早（UTC+8）的群不再自动加入 folder。空着表示不限制。
+  # inactive_before: "2026-08-20"
+  # 文件夹建满后，腾出最久没动静的群给新群。只移走另一个号文件夹里还留着的群。
+  auto_rotate_enabled: false
+  auto_rotate_inactive_days: 45
+  auto_rotate_keep_free: 15
+  auto_rotate_max_per_scan: 25
+  refresh_interval_minutes: 30
+  # 是否在 Delivery 分组内的项目群自动回复（测试阶段建议 false）
+  group_replies_enabled: false
+  # 试点：true 时仅下列群会自动回复 / 欢迎语
+  pilot_enabled: false
+  pilot_groups:
+    # - title: "Project X <> Delivery"
+    # - chat_id: -100xxxxxxxxxx
+
+trigger:
+  # Shared groups can require an explicit @mention before FAQ/social replies.
+  require_explicit_mention: false
+  # @你 或 像提问的消息，满足任一即可
+  require_mention_or_question: true
+  hint_keywords:
+    - "报价"
+    - "pricing"
+    - "quote"
+    - "deadline"
+
+reply:
+  rate_limit_seconds: 60
+  reply_delay_seconds: 10
+  bubble_gap_seconds: 30
+  # 低于此值保持静默；宁可不答，勿答非所问
+  min_relevance_score: 0.35
+  language: auto
+  # FAQ auto-reply footer (not used for welcome / mark-live / form workflows)
+  footer_enabled: false
+  footer_zh: ""
+  footer_en: ""
+
+rules:
+  - "严格跟随提问语言：中文问中文答，英文问英文答"
+  - "只能依据资料库回答，不得编造；依据不足或资料跑题时只输出 NEEDS_HUMAN"
+  - "禁止答非所问：主题必须对上；相关度不够或答不上就保持沉默，绝不硬答"
+  - "宁可沉默，也不要用擦边资料凑一篇看似相关的回复"
+  - "资料里有相关文档/帮助中心链接时，回复带上；申请/提交类 Google 表单仅当用户在问申请、提交项目或扶持报名时才贴；勿编造链接"
+  - "口吻像群里同事：口语、短、自然；少套话，别说「作为AI」「根据资料」「希望有帮助」"
+  - "不要编造报价、合同、排期、上币承诺；优先 1–3 条短消息，用单独一行 --- 分隔"
+  - "禁止反问澄清：不要「要哪家/需要我再发吗」；有多选项一次列全（带链接）；答不上就 NEEDS_HUMAN 沉默，不拉同事"
+
+learn:
+  enabled: true
+  trigger_word: "学习"
+  subdirectory: "learned"
+  min_chars: 5
+  scopes:
+    qa_test_groups: true
+    qa_testers: true
+    project_folder: true
+  # absorb/学习成功后 upsert 到 Lark「Agent 词条库」
+  agent_kb:
+    enabled: true
+    app_token: "basetoken"
+    table_id: "tblxxxxxxxx"
+    # view_id 仅便于人工打开表格，写入 API 不需要：YOUR_VIEW_ID
+
+safety:
+  blocked_topics:
+    - "报价"
+    - "价格"
+    - "合同"
+    - "pricing"
+
+knowledge:
+  directory: "knowledge"
+  chunk_size: 800
+  chunk_overlap: 100
+  top_k: 8
+
+# Lark Wiki 自动同步（凭证在 .env 的 LARK_* 变量）
+lark:
+  enabled: false
+  sync_on_startup: true
+  sync_interval_minutes: 60
+
+# 工作流：主网上线→发表单；表单→Lark（Apps Script）；钱包齐全→通知部门
+workflow:
+  enabled: false
+  poll_interval_minutes: 5
+  # Form + logo: webhook + status-watch (poll off). See scripts/LARK_LIVE_WEBHOOK.md
+  # Keep false when folders are large — each poll may resolve all chat titles.
+  # Prefer live_webhook + live_status_watch + mark-live instead.
+  form_logo_poll_enabled: false
+  live_webhook_enabled: true
+  live_webhook_host: "0.0.0.0"
+  # 交付号 keeps 8787. 审核号 on the same ECS uses 8786 so
+  # /workflow/tech-support/event (考核群补交) is not stolen by 交付号.
+  live_webhook_port: 8787
+  live_webhook_path: "/workflow/live"
+  live_webhook_secret: ""
+  live_startup_scan: false
+  # Backup when Feishu automation HTTP is missing: detect NEW live status only
+  # 两边都可开。KPI 检测仍只由 审核号写入结果。
+  live_status_watch_enabled: true
+  live_status_watch_seconds: 60
+  live_watch_state_file: "data/live_status_watch_state.json"
+  # Track enter/leave 主网部署中 / 测试网部署 for 交付日报
+  # When live_status_watch is on, piggybacks on the same Lark poll (no extra request).
+  deploy_status_watch_enabled: true
+  deploy_status_watch_seconds: 60
+  deploy_status_watch_state_file: "data/deploy_status_watch_state.json"
+  base_app_token: "basetoken"
+  progress_table_id: "tblxxxxxxxx"
+  status_field: "项目状态 Project Status"
+  trigger_status: "Mainnet Live"
+  tg_chat_id_field: ""
+  project_name_field: "项目名称 Project Name"
+  form_sent_field: ""
+  google_form_url: ""
+  baseline_existing_live: true
+  mark_live_commands:
+    - "项目已上线"
+    - "主网已上线"
+    - "/mark_live"
+    - "mark live"
+    - "上线完成"
+  operators:
+    - username: "operator_username"
+  # Report-only (交付日报 / 交付周报). No mark-live / send-form.
+  report_operators:
+    - username: "report_only_username"
+  mark_live_also_send_form: true
+  manual_commands:
+    - "/send_form"
+    - "发送上线表单"
+    - "send form"
+  message_template: |
+    🎉 Congratulations! {project_name} is now live on BOT Chain Mainnet.
+
+    Please submit your project info in this form. We will use it for website showcase / future gas rebates / potential grant support:
+    {form_url}
+
+    ---
+    Could you also coordinate a PR announcement on Twitter, mention that your project is live on BOT Chain. We will help to amplify.
+
+    ---
+    You can also have your project displayed on DeFiLlama under the BOT Chain section if you want. Here's how:
+    https://docs.google.com/document/d/1BXDfXq5KwpCi-A4eEO7ngE-a40uz3OM1/edit?usp=sharing&ouid=116519297133280129218&rtpof=true&sd=true
+
+    Thanks for your support ❤️
+  form_message_gap_seconds: 10
+  state_file: "data/form_dispatch_state.json"
+  # Fetch site logo into 项目logo（文件） (no retry on fail).
+  # 审核号 only: the 交付号 install at /opt/delivery-agent never uploads,
+  # even when this flag is true (avoids duplicate attachments).
+  logo_fill_enabled: true
+  logo_field: "项目logo（文件）"
+  # Form wallet table Project logo (URL text) → Progress Tracker URL column (fill empty only)
+  logo_link_sync_enabled: true
+  logo_link_field: "项目logo （链接）"
+  wallet_logo_field: "Project logo"
+  wallet_name_field: "Project name"
+  # 0 = reuse daily digest hour schedule
+  logo_link_sync_minutes: 0
+  live_link_field: "已上线链接🔗 Project Website URL"
+  project_link_field: "项目链接 Project Link"
+  logo_state_file: "data/logo_fill_state.json"
+  # Off by default: form data only syncs to Lark wallet table via Apps Script (no TG broadcast).
+  wallet_notify_enabled: false
+  wallet_table_id: "tblxxxxxxxx"
+  wallet_required_fields:
+    - "Project name"
+    - "Contract Addresss/主网合约"
+    - "Treasury Address"
+  wallet_notify_state_file: "data/wallet_notify_state.json"
+  # 表单发出后：合约 / 推特 / logo / 简介未齐则每天催一次，最多 10 天
+  form_chase_enabled: true
+  form_chase_after_hours: 24
+  # Legacy knob; chase now runs once daily at lark_digest_hour (default 00:00)
+  form_chase_scan_minutes: 1440
+  form_chase_min_filled: 4
+  form_chase_max_reminders: 10
+  form_chase_fields:
+    - "Mainnet Contract Addresss"
+    - "Link of Project X ( Formerly Twitter) Profile Page"
+    - "Project logo"
+    - "A brief introduction of your project"
+  form_chase_state_file: "data/form_chase_state.json"
+  form_chase_message_template: |
+    Hi {project_name} team — friendly reminder to finish this form. We use it for website showcase / future gas rebates / potential grant support.
+
+    Still missing:
+    {missing_fields}
+
+    Please fill these in when you can:
+    {form_url}
+
+    Thanks!
+  live_onboard_enabled: true
+  # audit | delivery; empty = infer (group_replies on → audit). Lark ping is audit account only.
+  live_onboard_account: ""
+  # Project verification push
+  live_onboard_lark_chat_id: "oc_xxxxxxxx"
+  live_onboard_bd_field: "BD"
+  live_onboard_peer_wait_seconds: 90
+  live_onboard_state_file: "/opt/botchain-shared/live_onboard_state.json"
+  # Google form received → Project verification push (审核号 only)
+  form_received_notify_enabled: false
+  form_received_notify_state_file: "/opt/botchain-shared/form_received_notify_state.json"
+  notify_chat_ids: []
+  notify_group_titles: []
+  lark_digest_enabled: true
+  lark_digest_chat_id: "oc_xxxxxxxx"
+  lark_digest_hour: 0
+  lark_digest_state_file: "data/lark_wallet_digest_state.json"
+  lark_digest_at_open_id: "ou_xxxxxxxx"
+  lark_digest_at_name: "财务"
+
+  # Please verify / mainnet-live → 看板人工队列 + Lark「delivery ops Lark group」提醒
+  # 只 审核号发。交付号线上配置为 false，避免同一条群消息发两次。
+  verify_alert_enabled: true
+  verify_alert_lark_chat_id: "oc_xxxxxxxx"
+  verify_alert_cooldown_hours: 0  # 0 = no same-chat cooldown
+  verify_alert_state_file: "data/verify_alert_state.json"
+
+  # KPI 检测与结果写入只在 审核号（botchain-qa）执行；交付号代码层会跳过。
+  # kpi_diag:
+  #   enabled: true
+
+llm:
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  temperature: 0.2
+  max_tokens: 800
+
+telegram:
+  session_name: "delivery_session"
+
+# 交付自动化可量化指标；默认开启
+# 命令：/stats|交付统计（明细）；/report|交付周报|交付报告（向上短版）
+# 日报：交付日报|/daily|今日:交付日报:（主网上线/部署存量/新群/钱包/Logo）
+metrics:
+  enabled: true
+  state_file: "data/delivery_metrics.json"
+  # Per-message JSONL detail (FAQ/social Processing path); cheap append-only
+  message_log_enabled: true
+  message_log_dir: "data/message_logs"
+  message_log_retain_days: 90
+  message_log_text_max: 500
+  # Set on the audit host only: the console renders this file as its 24h/7d/30d
+  # report so Telegram /日报 and the console share one ledger.
+  # period_reports_file: "/opt/botchain-shared/period_reports.json"
+  # period_reports_interval_minutes: 5
+
+welcome:
+  enabled: true
+  name_keywords:
+    - "projects"
+    - "partner"
+  # 0 = greet immediately on join (sample recent msgs → lang; else title; else EN)
+  # >0 = wait until N non-bot messages before greeting
+  min_messages_before_welcome: 0
+  # Backup catch-up only; join still greets via ChatAction
+  scan_interval_minutes: 15
+  state_file: "data/group_welcome_state.json"
+  # delay_seconds = seconds from sequence start
+  sequence_zh:
+    - delay_seconds: 0
+      text: "大家好，我是交付号，很高兴和大家对接 👋"
+    - delay_seconds: 30
+      text: |
+        这是Delivery集成的一些相关资料，比较详细，可以看一下：
+        https://docs.google.com/document/d/1xYzdfJlD08UOV9CKE3nV7NTSQg6lPz9B17aIW2NF5Wg/edit?tab=t.0#heading=h.av76fiyd7yav
+    - delay_seconds: 60
+      text: "其他任何相关的问题，随时在群里问我。"
+  sequence_en:
+    - delay_seconds: 0
+      text: "Hi everyone — I'm the delivery account. Glad to connect with you 👋"
+    - delay_seconds: 30
+      text: |
+        Here are some detailed Delivery integration docs — feel free to check them out:
+        https://docs.google.com/document/d/1xYzdfJlD08UOV9CKE3nV7NTSQg6lPz9B17aIW2NF5Wg/edit?tab=t.0#heading=h.av76fiyd7yav
+    - delay_seconds: 60
+      text: "For any other related questions, feel free to ask me in the group anytime."

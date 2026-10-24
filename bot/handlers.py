@@ -1,0 +1,1184 @@
+"""Telegram message handler."""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import time
+from typing import TYPE_CHECKING
+
+from telethon import events
+from telethon.tl.custom.message import Message
+
+from bot.config_loader import is_pilot_chat
+from bot.learn import contains_learn_trigger, handle_learn, in_learn_scope
+from bot.metrics import (
+    build_business_snapshot,
+    build_daily_report,
+    format_business_data_zh,
+    format_daily_report_zh,
+    format_report_zh,
+    format_stats_zh,
+    inc,
+    snapshot,
+    split_telegram_text,
+    write_report_file,
+)
+from bot.message_log import log_message_event
+from bot.rag import generate_reply, split_reply_bubbles
+from bot.triggers import (
+    is_ack_or_chitchat,
+    is_link_only_share,
+    delivery_alert_kind,
+    delivery_alert_kind_for_internal,
+    is_human_verify_request,
+    is_non_actionable_update,
+    is_qa_tester,
+    is_social_chitchat,
+    is_whitelisted,
+    is_report_operator,
+    is_workflow_operator,
+    pick_casual_reply,
+    should_process,
+)
+from bot.trusted_auto_learn import auto_learn_trusted_reply, is_trusted_sender
+from bot.workflow_form_dispatch import is_manual_form_command, send_form_manual
+from bot.workflow_mark_live import (
+    is_mark_live_command,
+    mark_live_from_group,
+    peek_mark_live_pending,
+    peek_mark_live_site_pending,
+    resolve_mark_live_reply,
+    resolve_mark_live_site_reply,
+    save_mark_live_pending,
+    save_mark_live_site_pending,
+)
+from bot.workflow_kpi_diag import is_kpi_diag_command, run_kpi_diag
+from bot.workflow_pr_capture import capture_pr_tweet, is_pr_capture_command
+from bot.workflow_tech_support import escalate_tech_support, is_tech_support_command
+
+_STATS_COMMANDS = frozenset({"/stats", "交付统计"})
+_REPORT_COMMANDS = frozenset({"/report", "交付周报", "交付报告"})
+_BUSINESS_DATA_COMMANDS = frozenset({"业务数据", "/业务数据"})
+_DAILY_REPORT_COMMANDS = frozenset(
+    {
+        "/daily",
+        "/daily_report",
+        "交付日报",
+        "日报",
+        "今日交付日报",
+        "今日:交付日报:",
+        "今日：交付日报：",
+        "今日:交付日报",
+        "今日：交付日报",
+    }
+)
+
+
+def _is_daily_report_command(text: str) -> bool:
+    """Exact match + tolerate extra spaces around the colon form."""
+    raw = (text or "").strip()
+    if raw in _DAILY_REPORT_COMMANDS:
+        return True
+    compact = "".join(raw.split())
+    return compact in {
+        "今日:交付日报:",
+        "今日：交付日报：",
+        "今日:交付日报",
+        "今日：交付日报",
+        "交付日报",
+        "今日交付日报",
+        "日报",
+    }
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient
+
+    from bot.config_loader import AppConfig
+    from bot.folder_scope import FolderScope
+    from bot.knowledge import KnowledgeBase
+
+logger = logging.getLogger(__name__)
+
+# HTML: entire footer bold+italic; @usernames stay plain so Telegram links them.
+_FOOTER_PARSE_MODE = "html"
+
+
+def _faq_footer_message(config: "AppConfig", language: str) -> str | None:
+    if not config.reply_footer_enabled:
+        return None
+    raw = (
+        config.reply_footer_en
+        if (language or "").lower() == "en"
+        else config.reply_footer_zh
+    )
+    text = (raw or "").strip()
+    if not text:
+        return None
+    return f"<b><i>{html.escape(text)}</i></b>"
+
+
+class MessageHandler:
+    def __init__(
+        self,
+        client: TelegramClient,
+        config: AppConfig,
+        scope: FolderScope,
+        kb: KnowledgeBase,
+    ) -> None:
+        self.client = client
+        self.config = config
+        self.scope = scope
+        self.kb = kb
+        self.my_id: int | None = None
+        self.my_username: str | None = None
+        self._last_reply: dict[tuple[int, int], float] = {}
+        self._processing: set[int] = set()
+
+    async def init_me(self) -> None:
+        me = await self.client.get_me()
+        self.my_id = me.id
+        self.my_username = (me.username or "").lower() or None
+        logger.info("Logged in as %s (id=%s)", me.username or me.first_name, me.id)
+
+    def _is_rate_limited(self, chat_id: int, user_id: int) -> bool:
+        key = (chat_id, user_id)
+        last = self._last_reply.get(key, 0)
+        return time.time() - last < self.config.rate_limit_seconds
+
+    def _mark_replied(self, chat_id: int, user_id: int) -> None:
+        self._last_reply[(chat_id, user_id)] = time.time()
+
+
+    async def _forward_verify_alert_only(
+        self,
+        event: events.NewMessage.Event,
+        *,
+        chat_id: int,
+        text: str,
+        sender_id: int | None,
+        sender_username: str | None,
+        qa_mode: bool,
+        in_qa_group: bool,
+        alert_kind: str,
+        source: str = "internal",
+    ) -> None:
+        """Push verify/mainnet-live to Lark without any Telegram reply."""
+        message: Message = event.message
+        try:
+            chat = await event.get_chat()
+            chat_title = getattr(chat, "title", None) or ""
+        except Exception:  # noqa: BLE001
+            chat_title = ""
+        if not chat_title:
+            try:
+                from bot.folder_title_cache import cached_chat_title
+
+                chat_title = cached_chat_title(chat_id) or ""
+            except Exception:  # noqa: BLE001
+                chat_title = ""
+
+        alert_meta: dict = {}
+        try:
+            from bot.workflow_verify_alert import maybe_send_verify_alert
+
+            alert_meta = maybe_send_verify_alert(
+                self.config,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                text=text,
+                kind=alert_kind,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("verify alert failed chat=%s source=%s", chat_id, source)
+            alert_meta = {"sent": False, "reason": "exception"}
+
+        reason = (
+            "mainnet live"
+            if alert_kind == "mainnet_live"
+            else "proceed mainnet verification"
+        )
+        log_message_event(
+            kind="human_review",
+            chat_id=chat_id,
+            chat_title=chat_title,
+            sender_id=sender_id,
+            sender_username=sender_username or "",
+            message_id=message.id,
+            text=text,
+            qa=qa_mode,
+            qa_group=in_qa_group,
+            outcome="silent",
+            reason=reason,
+            extra={
+                "alert": True,
+                "alert_kind": alert_kind,
+                "project_name": (alert_meta or {}).get("project_name") or "",
+                "lark_alert": (alert_meta or {}).get("reason") or "",
+                "lark_sent": bool((alert_meta or {}).get("sent")),
+                "internal_forward": True,
+                "source": source,
+            },
+        )
+        try:
+            inc("messages_processed")
+            inc("human_review_alerts")
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info(
+            "Internal verify→Lark chat=%s project=%r lark=%s source=%s",
+            chat_id,
+            (alert_meta or {}).get("project_name"),
+            (alert_meta or {}).get("reason"),
+            source,
+        )
+
+    async def handle(self, event: events.NewMessage.Event) -> None:
+        message: Message = event.message
+        if not message:
+            return
+        if self.my_id is None:
+            return
+
+        chat_id = event.chat_id
+        if chat_id is None:
+            return
+
+        if chat_id in self.config.ignored_group_ids:
+            return
+
+        sender = await event.get_sender()
+        sender_id = getattr(sender, "id", None)
+        sender_username = getattr(sender, "username", None)
+        qa_tester = is_qa_tester(
+            sender_id,
+            sender_username,
+            self.config.qa_tester_user_ids,
+            self.config.qa_tester_usernames,
+        )
+
+        # Scope is every group this account has joined, not Telegram folder membership.
+        in_folder = (
+            self.config.group_replies_enabled
+            and self.scope.contains(chat_id)
+            and is_pilot_chat(self.config, chat_id)
+        )
+        in_project_folder = self.scope.contains(chat_id)
+        in_qa_private = qa_tester and event.is_private
+        in_qa_group = chat_id in self.config.qa_test_group_ids
+        qa_mode = qa_tester or in_qa_group
+        # QA test groups still work even outside pilot list
+        in_reply_scope = in_folder or in_qa_private or in_qa_group
+
+        text = (message.raw_text or "").strip()
+        has_learn_trigger = self.config.learn_enabled and contains_learn_trigger(
+            text, self.config.learn_trigger_word
+        )
+        workflow_op = is_workflow_operator(
+            sender_id,
+            sender_username,
+            self.config.workflow_operator_user_ids,
+            self.config.workflow_operator_usernames,
+        )
+        report_op = is_report_operator(
+            sender_id,
+            sender_username,
+            self.config.workflow_report_operator_user_ids,
+            self.config.workflow_report_operator_usernames,
+        )
+        is_mark_live = is_mark_live_command(
+            text, self.config.workflow_mark_live_commands
+        )
+        is_form_cmd = is_manual_form_command(
+            text, self.config.workflow_manual_commands
+        )
+        is_tech_cmd = is_tech_support_command(text)
+        is_pr_cmd = is_pr_capture_command(
+            text, getattr(self.config, "pr_capture_commands", None)
+        )
+        is_diag_cmd = is_kpi_diag_command(text)
+        is_stats_cmd = text in _STATS_COMMANDS
+        is_report_cmd = text in _REPORT_COMMANDS
+        is_daily_cmd = _is_daily_report_command(text)
+        is_business_cmd = text in _BUSINESS_DATA_COMMANDS
+        delivery_account = bool(message.out) or (
+            self.my_id is not None and sender_id == self.my_id
+        )
+        can_ops = qa_tester or delivery_account or workflow_op
+        # Daily / weekly reports: full operators + report-only allowlist.
+        can_report = can_ops or report_op
+
+        # Mark-live: quote Ambiguous reply + project name, or quote website
+        # reminder + site URL. Runs before BD ignore so project teams can paste
+        # the website even when the sender is on the no-reply list.
+        reply_to_msg_id = getattr(message, "reply_to_msg_id", None)
+        if (
+            self.config.workflow_enabled
+            and not event.is_private
+            and reply_to_msg_id is not None
+            and text
+            and not is_mark_live
+            and not is_form_cmd
+            and not is_tech_cmd
+            and not is_pr_cmd
+            and not is_diag_cmd
+            and not is_stats_cmd
+            and not is_report_cmd
+            and not is_daily_cmd
+            and not is_business_cmd
+        ):
+            quoted_id = int(reply_to_msg_id)
+            if peek_mark_live_site_pending(chat_id, quoted_id) is not None:
+                msg_id = message.id
+                if msg_id not in self._processing:
+                    self._processing.add(msg_id)
+                    try:
+                        site_reply = await resolve_mark_live_site_reply(
+                            self.config,
+                            chat_id=chat_id,
+                            quoted_msg_id=quoted_id,
+                            reply_text=text,
+                        )
+                        if site_reply is not None:
+                            await message.reply(site_reply)
+                            return
+                    except Exception:
+                        logger.exception(
+                            "Mark-live site submit failed in chat %s", chat_id
+                        )
+                        await message.reply(
+                            "Failed to save the website. Check logs."
+                        )
+                        return
+                    finally:
+                        self._processing.discard(msg_id)
+            if (
+                can_ops
+                and peek_mark_live_pending(chat_id, quoted_id) is not None
+            ):
+                msg_id = message.id
+                if msg_id not in self._processing:
+                    self._processing.add(msg_id)
+                    try:
+                        chat = await event.get_chat()
+                        title = getattr(chat, "title", None) or ""
+                        resolved = await resolve_mark_live_reply(
+                            self.client,
+                            self.config,
+                            chat_id=chat_id,
+                            chat_title=title,
+                            quoted_msg_id=quoted_id,
+                            picked_text=text,
+                            scope=self.scope,
+                        )
+                        if resolved is not None:
+                            inc("mark_live_resolve")
+                            reply_msg = await message.reply(resolved.text)
+                            if resolved.need_site:
+                                rid, pname = resolved.need_site
+                                save_mark_live_site_pending(
+                                    chat_id=chat_id,
+                                    reply_msg_id=int(reply_msg.id),
+                                    record_id=rid,
+                                    project_name=pname,
+                                )
+                            return
+                    except Exception:
+                        logger.exception(
+                            "Mark-live resolve failed in chat %s", chat_id
+                        )
+                        await message.reply(
+                            "Failed to resolve ambiguous mark-live. Check logs."
+                        )
+                        return
+                    finally:
+                        self._processing.discard(msg_id)
+
+        # Trusted subject-matter experts remain on the no-reply list, but their
+        # contextual business answers can be learned before that early return.
+        if (
+            not message.out
+            and not event.is_private
+            and in_project_folder
+            and is_trusted_sender(sender_id, sender_username, self.config)
+        ):
+            try:
+                chat = await event.get_chat()
+                await auto_learn_trusted_reply(
+                    message,
+                    self.kb,
+                    self.config,
+                    chat_id=chat_id,
+                    chat_title=getattr(chat, "title", None) or "",
+                    sender_id=sender_id,
+                    sender_username=sender_username,
+                )
+            except Exception:
+                logger.exception(
+                    "Trusted auto-learn failed in chat %s sender=%s",
+                    chat_id,
+                    sender_id,
+                )
+
+        # Operator stats / exec report / daily report / all-time business snapshot.
+        # Stats stay on full operators; daily/weekly/业务数据 also allow report_operators.
+        if (is_stats_cmd and can_ops) or (
+            (is_report_cmd or is_daily_cmd or is_business_cmd) and can_report
+        ):
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                loop = asyncio.get_running_loop()
+                if is_business_cmd:
+                    snap = await loop.run_in_executor(
+                        None, lambda: build_business_snapshot(self.config)
+                    )
+                    await message.reply(format_business_data_zh(snap))
+                elif is_daily_cmd:
+                    # Refresh wallet first_seen so "今日新收集" includes latest rows.
+                    try:
+                        from bot.workflow_lark_wallet_group import sync_wallet_first_seen
+
+                        await sync_wallet_first_seen(self.config)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("Daily report: wallet first_seen sync failed")
+                    daily = await loop.run_in_executor(
+                        None,
+                        lambda: build_daily_report(
+                            self.config, calendar_day=True
+                        ),
+                    )
+                    chunks = split_telegram_text(format_daily_report_zh(daily))
+                    for i, chunk in enumerate(chunks):
+                        await message.reply(chunk)
+                        if i + 1 < len(chunks):
+                            await asyncio.sleep(0.35)
+                else:
+                    snap = await loop.run_in_executor(
+                        None, lambda: snapshot(self.config, include_lark=True)
+                    )
+                    if is_report_cmd:
+                        report = format_report_zh(snap)
+                        await loop.run_in_executor(None, lambda: write_report_file(snap))
+                        chunks = split_telegram_text(report)
+                        for i, chunk in enumerate(chunks):
+                            await message.reply(chunk)
+                            if i + 1 < len(chunks):
+                                await asyncio.sleep(0.35)
+                    else:
+                        await message.reply(format_stats_zh(snap))
+            except Exception:
+                logger.exception("Stats/report command failed in chat %s", chat_id)
+                await message.reply("统计生成失败，请查看日志。")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        # BD blacklist: never auto-respond on TG, except workflow operators on
+        # mark-live/form. Verify / mainnet-live still forward to Lark only.
+        # QA test groups are support channels — ignore list does not apply there.
+        if (
+            not message.out
+            and not in_qa_group
+            and is_whitelisted(
+                sender_id,
+                sender_username,
+                self.config.ignore_user_ids,
+                self.config.ignore_usernames,
+            )
+            and not (workflow_op and (is_mark_live or is_form_cmd or is_pr_cmd or is_diag_cmd))
+        ):
+            _internal_alert = delivery_alert_kind_for_internal(text)
+            # Verify must not wait for folder/pilot scope — new groups often
+            # land messages before folder_auto_add / migrate settles.
+            if _internal_alert:
+                await self._forward_verify_alert_only(
+                    event,
+                    chat_id=chat_id,
+                    text=text,
+                    sender_id=sender_id,
+                    sender_username=sender_username,
+                    qa_mode=qa_mode,
+                    in_qa_group=in_qa_group,
+                    alert_kind=_internal_alert,
+                    source="bd_ignore",
+                )
+            else:
+                logger.debug(
+                    "Skip BD/blacklist sender %s (@%s) in chat %s",
+                    sender_id,
+                    sender_username,
+                    chat_id,
+                )
+            return
+
+        # Tech support: quote question + "tech support" → Lark 答疑群 → reply back
+        # Only the bot account that typed the command (message.out) to avoid double fire.
+        if (
+            getattr(self.config, "tech_support_enabled", False)
+            and not event.is_private
+            and is_tech_cmd
+        ):
+            if not (message.out or (self.my_id is not None and sender_id == self.my_id)):
+                return
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", None) or ""
+                result = await escalate_tech_support(
+                    self.client,
+                    self.config,
+                    command_message=message,
+                    chat_id=chat_id,
+                    chat_title=title,
+                )
+                await message.reply(result)
+            except Exception:
+                logger.exception("Tech support failed in chat %s", chat_id)
+                await message.reply("Failed to escalate tech support. Check logs.")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        # PR capture: quote PR post + "pr support" → overwrite official KPI 2.
+        # Only the bot account that typed the command (message.out) to avoid double fire.
+        if (
+            getattr(self.config, "pr_capture_enabled", False)
+            and not event.is_private
+            and is_pr_cmd
+        ):
+            if not (message.out or (self.my_id is not None and sender_id == self.my_id)):
+                return
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", None) or ""
+                result = await capture_pr_tweet(
+                    self.client,
+                    self.config,
+                    command_message=message,
+                    chat_id=chat_id,
+                    chat_title=title,
+                )
+                await message.reply(result)
+            except Exception:
+                logger.exception("PR capture failed in chat %s", chat_id)
+                await message.reply("Failed to save PR tweet. Check logs.")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        # KPI diag. In a project group, the group title selects the project.
+        # In 审核号's own chat, the project name follows the command.
+        # Other people's private messages never run it.
+        if (
+            getattr(self.config, "workflow_kpi_diag_enabled", False)
+            and is_diag_cmd
+        ):
+            if event.is_private and not delivery_account:
+                return
+            if not event.is_private and not (delivery_account or can_ops):
+                return
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", None) or ""
+                result = await run_kpi_diag(
+                    self.client,
+                    self.config,
+                    command_message=message,
+                    chat_id=chat_id,
+                    chat_title=title,
+                    private=bool(event.is_private),
+                )
+                await message.reply(result)
+            except Exception:
+                logger.exception("KPI diag failed in chat %s", chat_id)
+                await message.reply("Failed to run KPI diag. Check logs.")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        # Workflow: keyword in any group → mark Lark status live (+ optional form)
+        # Operators / delivery / QA do not require Delivery folder membership.
+        if (
+            self.config.workflow_enabled
+            and not event.is_private
+            and is_mark_live
+        ):
+            # Delivery account, QA testers, or configured workflow operators
+            if not can_ops:
+                logger.info(
+                    "Mark-live ignored from non-operator chat=%s sender=%s",
+                    chat_id,
+                    sender_id,
+                )
+                return
+
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", None) or ""
+                inc("mark_live_triggers")
+                outcome = await mark_live_from_group(
+                    self.client, self.config, chat_id, title, scope=self.scope
+                )
+                reply_msg = await message.reply(outcome.text)
+                if outcome.candidates:
+                    save_mark_live_pending(
+                        chat_id=chat_id,
+                        reply_msg_id=int(reply_msg.id),
+                        chat_title=title,
+                        candidates=outcome.candidates,
+                    )
+                if outcome.need_site:
+                    rid, pname = outcome.need_site
+                    save_mark_live_site_pending(
+                        chat_id=chat_id,
+                        reply_msg_id=int(reply_msg.id),
+                        record_id=rid,
+                        project_name=pname,
+                    )
+            except Exception:
+                logger.exception("Mark-live failed in chat %s", chat_id)
+                await message.reply("Failed to update Lark status. Check logs.")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        # Workflow manual fallback: send Google Form in current group (any group)
+        if (
+            self.config.workflow_enabled
+            and not event.is_private
+            and is_form_cmd
+        ):
+            if not can_ops:
+                logger.info(
+                    "Form command ignored from non-operator chat=%s sender=%s",
+                    chat_id,
+                    sender_id,
+                )
+                return
+
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                chat = await event.get_chat()
+                title = getattr(chat, "title", None) or ""
+                inc("send_form_triggers")
+                result = await send_form_manual(self.client, self.config, chat_id, title)
+                await message.reply(result)
+            except Exception:
+                logger.exception("Manual form dispatch failed in chat %s", chat_id)
+                await message.reply("Failed to send form. Check logs.")
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        if has_learn_trigger and in_learn_scope(
+            chat_id, qa_tester, in_qa_group, in_project_folder, self.config
+        ):
+            # Delivery 项目群内仅 QA 测试账号可写入知识库
+            if (
+                in_project_folder
+                and not in_qa_group
+                and not event.is_private
+                and not qa_tester
+                and not message.out
+            ):
+                logger.info("Learn rejected: non-qa user in delivery group chat=%s", chat_id)
+                return
+
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                result = await handle_learn(
+                    message,
+                    self.kb,
+                    self.config,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_username=sender_username,
+                    owner_id=self.my_id,
+                )
+                if result.success or result.message != "no trigger":
+                    await message.reply(result.message)
+            except Exception:
+                logger.exception("Learn failed in chat %s", chat_id)
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        if message.out:
+            return
+
+        # Verify / mainnet-live → Dashboard human_review + Lark 交付部; no FAQ.
+        _alert_kind = delivery_alert_kind(text)
+        if _alert_kind:
+            try:
+                chat = await event.get_chat()
+                chat_title = getattr(chat, "title", None) or ""
+            except Exception:  # noqa: BLE001
+                chat_title = ""
+            if not chat_title:
+                try:
+                    from bot.folder_title_cache import cached_chat_title
+
+                    chat_title = cached_chat_title(chat_id) or ""
+                except Exception:  # noqa: BLE001
+                    chat_title = ""
+
+            alert_meta: dict = {}
+            try:
+                from bot.workflow_verify_alert import maybe_send_verify_alert
+
+                alert_meta = maybe_send_verify_alert(
+                    self.config,
+                    chat_id=chat_id,
+                    chat_title=chat_title,
+                    sender_id=sender_id,
+                    sender_username=sender_username or "",
+                    text=text,
+                    kind=_alert_kind,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("verify alert failed chat=%s", chat_id)
+                alert_meta = {"sent": False, "reason": "exception"}
+
+            reason = (
+                "mainnet live"
+                if _alert_kind == "mainnet_live"
+                else "proceed mainnet verification"
+            )
+            log_message_event(
+                kind="human_review",
+                chat_id=chat_id,
+                chat_title=chat_title,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                message_id=message.id,
+                text=text,
+                qa=qa_mode,
+                qa_group=in_qa_group,
+                outcome="silent",
+                reason=reason,
+                extra={
+                    "alert": True,
+                    "alert_kind": _alert_kind,
+                    "project_name": (alert_meta or {}).get("project_name") or "",
+                    "lark_alert": (alert_meta or {}).get("reason") or "",
+                    "lark_sent": bool((alert_meta or {}).get("sent")),
+                },
+            )
+            try:
+                inc("messages_processed")
+                inc("human_review_alerts")
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info(
+                "Queued verify human_review chat=%s project=%r lark=%s",
+                chat_id,
+                (alert_meta or {}).get("project_name"),
+                (alert_meta or {}).get("reason"),
+            )
+            return
+
+        if not in_reply_scope:
+            return
+
+        if is_whitelisted(
+            sender_id,
+            sender_username,
+            self.config.ignore_user_ids,
+            self.config.ignore_usernames,
+        ) and not qa_mode:
+            _internal_alert = delivery_alert_kind_for_internal(text)
+            if _internal_alert:
+                await self._forward_verify_alert_only(
+                    event,
+                    chat_id=chat_id,
+                    text=text,
+                    sender_id=sender_id,
+                    sender_username=sender_username,
+                    qa_mode=qa_mode,
+                    in_qa_group=in_qa_group,
+                    alert_kind=_internal_alert,
+                    source="whitelist",
+                )
+            else:
+                logger.debug(
+                    "Skip whitelisted sender %s in chat %s", sender_id, chat_id
+                )
+            return
+
+        # Bare URL / link share → do not FAQ (avoids /market path → token-market docs).
+        # Exception: pure X/Twitter shares still get a short social reply.
+        if is_link_only_share(text) and not is_social_chitchat(text):
+            log_message_event(
+                kind="faq",
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                message_id=message.id,
+                text=text,
+                outcome="silent",
+                reason="skip_link_only_share",
+            )
+            logger.info("Skip link-only share in chat %s", chat_id)
+            return
+
+        # Social gm / X-post / short acks (收到、thanks…) → casual reply, not FAQ
+        if is_social_chitchat(text) or is_ack_or_chitchat(text):
+            if sender_id is not None and not qa_mode and self._is_rate_limited(
+                chat_id, sender_id
+            ):
+                logger.info(
+                    "Rate limited casual reply user %s in chat %s", sender_id, chat_id
+                )
+                return
+            msg_id = message.id
+            if msg_id in self._processing:
+                return
+            self._processing.add(msg_id)
+            try:
+                reply = pick_casual_reply(
+                    text, seed=(chat_id or 0) ^ (msg_id or 0)
+                )
+                delay = 0 if qa_mode else min(8, max(0, self.config.reply_delay_seconds))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await message.reply(reply)
+                if sender_id is not None:
+                    self._mark_replied(chat_id, sender_id)
+                reason = (
+                    "social_chitchat"
+                    if is_social_chitchat(text)
+                    else "ack_chitchat"
+                )
+                try:
+                    inc("messages_processed")
+                    inc("social_chitchat_replies")
+                except Exception:  # noqa: BLE001
+                    pass
+                log_message_event(
+                    kind="social",
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_username=sender_username or "",
+                    message_id=msg_id,
+                    text=text,
+                    reply_text=reply,
+                    qa=qa_mode,
+                    qa_group=in_qa_group,
+                    outcome="replied",
+                    reason=reason,
+                    extra={"outbound_logged": True},
+                )
+                logger.info(
+                    "Casual reply (%s) in chat %s: %r", reason, chat_id, reply
+                )
+            except Exception:
+                logger.exception("Casual reply failed in chat %s", chat_id)
+                log_message_event(
+                    kind="social",
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_username=sender_username or "",
+                    message_id=msg_id,
+                    text=text,
+                    qa=qa_mode,
+                    qa_group=in_qa_group,
+                    outcome="error",
+                    reason="casual_reply_failed",
+                )
+            finally:
+                self._processing.discard(msg_id)
+            return
+
+        if not should_process(
+            message,
+            self.my_id,
+            self.my_username,
+            self.config.hint_keywords,
+            self.config.require_mention_or_question,
+            qa_tester=qa_mode,
+        ):
+            return
+
+
+        # Mentions and delivery keywords can pull plain project updates into
+        # the FAQ path. They are not failed answers and must not inflate the
+        # silence rate.
+        if not qa_mode and is_non_actionable_update(text):
+            log_message_event(
+                kind="faq",
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                message_id=message.id,
+                text=text,
+                qa=qa_tester,
+                qa_group=in_qa_group,
+                outcome="ignored",
+                reason="no reply needed: project update",
+            )
+            logger.info("No reply needed for project update in chat %s", chat_id)
+            return
+
+        if sender_id is not None and not qa_mode and self._is_rate_limited(chat_id, sender_id):
+            logger.info("Rate limited user %s in chat %s", sender_id, chat_id)
+            return
+
+        msg_id = message.id
+        if msg_id in self._processing:
+            return
+        self._processing.add(msg_id)
+
+        question = text
+        logger.info(
+            "Processing chat=%s sender=%s (@%s) qa=%s qa_group=%s: %s",
+            chat_id,
+            sender_id,
+            sender_username,
+            qa_tester,
+            in_qa_group,
+            question[:120],
+        )
+        try:
+            inc("messages_processed")
+        except Exception:  # noqa: BLE001
+            pass
+
+        started_at = time.time()
+        try:
+            decision = await generate_reply(question, self.kb, self.config)
+            if not decision.should_reply:
+                if decision.reason == "no reply needed":
+                    log_message_event(
+                        kind="faq",
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        sender_username=sender_username or "",
+                        message_id=msg_id,
+                        text=question,
+                        qa=qa_tester,
+                        qa_group=in_qa_group,
+                        outcome="ignored",
+                        reason=decision.reason,
+                        score=decision.best_score,
+                    )
+                    logger.info(
+                        "No reply needed after intent check (score=%.2f)",
+                        decision.best_score,
+                    )
+                    return
+                # Fallback: if FAQ silenced a share/greeting/ack that slipped through
+                if is_social_chitchat(question) or is_ack_or_chitchat(question):
+                    reply = pick_casual_reply(
+                        question, seed=(chat_id or 0) ^ (msg_id or 0)
+                    )
+                    delay = 0 if qa_mode else min(
+                        8, max(0, self.config.reply_delay_seconds)
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    await message.reply(reply)
+                    if sender_id is not None:
+                        self._mark_replied(chat_id, sender_id)
+                    try:
+                        inc("social_chitchat_replies")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    log_message_event(
+                        kind="faq",
+                        chat_id=chat_id,
+                        sender_id=sender_id,
+                        sender_username=sender_username or "",
+                        message_id=msg_id,
+                        text=question,
+                        reply_text=reply,
+                        qa=qa_tester,
+                        qa_group=in_qa_group,
+                        outcome="replied",
+                        reason=f"casual_fallback:{decision.reason}",
+                        score=decision.best_score,
+                        extra={"outbound_logged": True},
+                    )
+                    logger.info(
+                        "Casual fallback after FAQ silence (%s) in chat %s: %r",
+                        decision.reason,
+                        chat_id,
+                        reply,
+                    )
+                    return
+                log_message_event(
+                    kind="faq",
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    sender_username=sender_username or "",
+                    message_id=msg_id,
+                    text=question,
+                    qa=qa_tester,
+                    qa_group=in_qa_group,
+                    outcome="silent",
+                    reason=decision.reason,
+                    score=decision.best_score,
+                )
+                logger.info(
+                    "No reply: %s (score=%.2f)", decision.reason, decision.best_score
+                )
+                return
+
+            # 项目群：故意等待，避免秒回像机器人；QA 测试不延迟
+            delay = 0 if qa_mode else max(0, self.config.reply_delay_seconds)
+            if delay > 0:
+                elapsed = time.time() - started_at
+                wait = delay - elapsed
+                if wait > 0:
+                    logger.info(
+                        "Delaying reply %.0fs in chat %s (target=%ss)",
+                        wait,
+                        chat_id,
+                        delay,
+                    )
+                    await asyncio.sleep(wait)
+
+            bubbles = split_reply_bubbles(decision.text)
+            # First bubble as reply; follow-ups as separate short messages (more human)
+            gap = 0 if qa_mode else max(0, self.config.bubble_gap_seconds)
+            for i, bubble in enumerate(bubbles):
+                if i == 0:
+                    await message.reply(bubble)
+                else:
+                    if gap > 0:
+                        logger.info(
+                            "Delaying bubble %d/%d by %ss in chat %s",
+                            i + 1,
+                            len(bubbles),
+                            gap,
+                            chat_id,
+                        )
+                        await asyncio.sleep(gap)
+                    await self.client.send_message(chat_id, bubble)
+
+            # FAQ path only: one bold+italic disclaimer after successful auto-reply
+            footer = _faq_footer_message(self.config, decision.language)
+            if footer:
+                if gap > 0 and bubbles:
+                    await asyncio.sleep(gap)
+                await self.client.send_message(
+                    chat_id, footer, parse_mode=_FOOTER_PARSE_MODE
+                )
+
+            if sender_id is not None:
+                self._mark_replied(chat_id, sender_id)
+            # One FAQ reply session (not per-bubble); bubbles + footer counted too
+            if bubbles:
+                inc("faq_reply_sessions")
+                inc("faq_bubbles_sent", len(bubbles))
+            if footer:
+                inc("faq_footer_sent")
+            reply_joined = "\n---\n".join(bubbles) if bubbles else ""
+            if footer:
+                reply_joined = (
+                    f"{reply_joined}\n---\n{footer}" if reply_joined else footer
+                )
+            log_message_event(
+                kind="faq",
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                message_id=msg_id,
+                text=question,
+                reply_text=reply_joined,
+                qa=qa_tester,
+                qa_group=in_qa_group,
+                outcome="replied",
+                reason=decision.reason,
+                score=decision.best_score,
+                bubbles=len(bubbles),
+                extra={"footer": bool(footer), "outbound_logged": True},
+            )
+            logger.info(
+                "Replied in chat %s (%s, %d bubble(s)%s)",
+                chat_id,
+                decision.reason,
+                len(bubbles),
+                ", +footer" if footer else "",
+            )
+        except Exception:
+            logger.exception("Failed to handle message in chat %s", chat_id)
+            log_message_event(
+                kind="faq",
+                chat_id=chat_id,
+                sender_id=sender_id,
+                sender_username=sender_username or "",
+                message_id=msg_id,
+                text=question,
+                qa=qa_tester,
+                qa_group=in_qa_group,
+                outcome="error",
+                reason="handler_exception",
+            )
+        finally:
+            self._processing.discard(msg_id)
+
+    def register(self) -> None:
+        @self.client.on(events.NewMessage())
+        async def _on_message(event: events.NewMessage.Event) -> None:
+            asyncio.create_task(self.handle(event))
+
+        @self.client.on(events.NewMessage(outgoing=True))
+        async def _on_outgoing(event: events.NewMessage.Event) -> None:
+            asyncio.create_task(self._count_outgoing(event))
+
+    async def _count_outgoing(self, event: events.NewMessage.Event) -> None:
+        """Count and persist every outbound message from the delivery account."""
+        try:
+            message = event.message
+            if not message:
+                return
+            # Skip pure service actions (join/title change/etc.)
+            if getattr(message, "action", None) is not None:
+                return
+            text = (message.raw_text or "").strip()
+            has_media = bool(getattr(message, "media", None))
+            if not text and not has_media:
+                return
+            inc("messages_sent")
+            reply_to_message_id = getattr(message, "reply_to_msg_id", None)
+            extra = {"media": has_media, "outbound_logged": True}
+            if reply_to_message_id is not None:
+                extra["reply_to_message_id"] = int(reply_to_message_id)
+            log_message_event(
+                kind="outbound",
+                chat_id=getattr(message, "chat_id", None) or getattr(event, "chat_id", None),
+                message_id=getattr(message, "id", None),
+                text=text or "[媒体消息]",
+                outcome="sent",
+                reason="telegram_outgoing",
+                extra=extra,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed counting outgoing message")

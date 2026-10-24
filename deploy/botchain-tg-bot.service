@@ -1,0 +1,20 @@
+# Deprecated alias — prefer deploy/botchain-qa.service (unit name: botchain-qa)
+[Unit]
+Description=Botchain QA Telegram Userbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/botchain-qa-tg-bot
+EnvironmentFile=/opt/botchain-qa-tg-bot/.env
+ExecStart=/opt/botchain-qa-tg-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

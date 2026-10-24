@@ -1,0 +1,375 @@
+"""HTTP webhook for Lark/Feishu automation: status → live → form + logo immediately."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import TYPE_CHECKING, Any
+
+from aiohttp import web
+
+from bot.workflow_live_trigger import process_live_project
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient
+
+    from bot.config_loader import AppConfig
+    from bot.folder_scope import FolderScope
+
+logger = logging.getLogger(__name__)
+
+
+def _webhook_secret(config: AppConfig) -> str:
+    return (
+        os.getenv("WORKFLOW_LIVE_WEBHOOK_SECRET", "").strip()
+        or getattr(config, "workflow_live_webhook_secret", "")
+        or ""
+    ).strip()
+
+
+def _extract_payload(data: Any) -> tuple[str | None, str | None]:
+    """Best-effort parse record_id / project_name from automation or event JSON."""
+    if not isinstance(data, dict):
+        return None, None
+
+    # url_verification handled elsewhere
+    record_id = (
+        data.get("record_id")
+        or data.get("recordId")
+        or data.get("recordID")
+        or data.get("rec_id")
+    )
+    project_name = (
+        data.get("project_name")
+        or data.get("projectName")
+        or data.get("项目名称")
+        or data.get("name")
+    )
+
+    # nested common shapes
+    for key in ("record", "data", "object", "event"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            rid2, name2 = _extract_payload(nested)
+            record_id = record_id or rid2
+            project_name = project_name or name2
+
+    # Lark automation sometimes puts fields under fields{}
+    fields = data.get("fields")
+    if isinstance(fields, dict):
+        for k in ("项目名称 Project Name", "项目名称", "Project name", "Project Name"):
+            if fields.get(k) and not project_name:
+                v = fields.get(k)
+                if isinstance(v, list) and v:
+                    v = v[0]
+                if isinstance(v, dict):
+                    project_name = str(v.get("text") or v.get("name") or "")
+                else:
+                    project_name = str(v)
+
+    if record_id is not None:
+        record_id = str(record_id).strip() or None
+    if project_name is not None:
+        project_name = str(project_name).strip() or None
+    return record_id, project_name
+
+
+def _authorized(request: web.Request, config: AppConfig) -> bool:
+    secret = _webhook_secret(config)
+    if not secret:
+        # Misconfig: reject rather than open relay
+        return False
+    header = (request.headers.get("X-Webhook-Secret") or "").strip()
+    query = (request.rel_url.query.get("secret") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    bearer = ""
+    if auth.lower().startswith("bearer "):
+        bearer = auth[7:].strip()
+    return secret in {header, query, bearer}
+
+
+async def start_live_webhook_server(
+    client: TelegramClient,
+    config: AppConfig,
+    scope: FolderScope,
+    kb: Any | None = None,
+) -> web.AppRunner | None:
+    live_on = bool(getattr(config, "workflow_live_webhook_enabled", False))
+    tech_on = bool(getattr(config, "tech_support_enabled", False)) or bool(
+        getattr(config, "lark_relay_enabled", True)
+    )
+    backlink_on = bool(getattr(config, "pr_backlink_enabled", False))
+    if live_on and not _webhook_secret(config):
+        logger.error(
+            "live webhook enabled but WORKFLOW_LIVE_WEBHOOK_SECRET / "
+            "workflow.live_webhook_secret is empty — live route not started"
+        )
+        live_on = False
+    if not (live_on or tech_on or backlink_on):
+        return None
+
+    path = getattr(config, "workflow_live_webhook_path", "/workflow/live") or "/workflow/live"
+    if not path.startswith("/"):
+        path = "/" + path
+
+    async def health(_: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "service": "delivery-live-webhook"})
+
+    async def live_handler(request: web.Request) -> web.Response:
+        # Lark event URL verification (no secret on first challenge in some setups)
+        try:
+            raw = await request.read()
+            data = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+        except Exception:
+            data = {}
+
+        if isinstance(data, dict) and data.get("type") == "url_verification":
+            challenge = data.get("challenge", "")
+            return web.json_response({"challenge": challenge})
+
+        if not _authorized(request, config):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        try:
+            from bot.metrics import inc
+
+            inc("webhook_live_received")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Also accept query params for simple automation tests
+        record_id, project_name = _extract_payload(data)
+        if not record_id:
+            record_id = (request.rel_url.query.get("record_id") or "").strip() or None
+        if not project_name:
+            project_name = (request.rel_url.query.get("project_name") or "").strip() or None
+
+        if not record_id and not project_name:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "need record_id or project_name in JSON body or query",
+                },
+                status=400,
+            )
+
+        # Optional status gate from payload
+        status = None
+        if isinstance(data, dict):
+            status = (
+                data.get("status")
+                or data.get("项目状态 Project Status")
+                or data.get("项目状态")
+            )
+        if status and str(status).strip() != config.workflow_trigger_status:
+            # Still allow if they only send record_id and status already live in table
+            logger.info(
+                "live webhook payload status=%r (will verify against Lark row)",
+                status,
+            )
+
+        result = await process_live_project(
+            client,
+            config,
+            scope,
+            record_id=record_id,
+            project_name=project_name,
+            require_live_status=True,
+            source="lark_webhook",
+        )
+        if not result.get("error"):
+            try:
+                from bot.metrics import inc
+
+                inc("webhook_live_processed")
+            except Exception:  # noqa: BLE001
+                pass
+        code = 200 if not result.get("error") else 422
+        return web.json_response(result, status=code)
+
+    
+    async def tech_support_event(request: web.Request) -> web.Response:
+        """Lark event callback: reply-to-ticket → TG quote reply."""
+        try:
+            raw = await request.read()
+            data = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and data.get("type") == "url_verification":
+            return web.json_response({"challenge": data.get("challenge", "")})
+        # Encrypt challenge (schema 2.0)
+        if isinstance(data, dict) and data.get("challenge") and not data.get("header"):
+            return web.json_response({"challenge": data.get("challenge")})
+
+        event = {}
+        if isinstance(data, dict):
+            event = data.get("event") or {}
+            header = data.get("header") or {}
+            event_type = header.get("event_type") or data.get("type") or ""
+        else:
+            event_type = ""
+        if event_type and "im.message.receive" not in str(event_type):
+            return web.json_response({"ok": True, "ignored": True, "reason": "not_message_event"})
+
+        try:
+            from bot.workflow_lark_bridge import maybe_handle_lark_bridge
+            from bot.workflow_lark_recall import maybe_handle_lark_recall
+            from bot.workflow_lark_relay import maybe_handle_lark_relay
+            from bot.workflow_tech_support import (
+                ingest_lark_message_event,
+                process_lark_reply_candidate,
+            )
+            payload = event if isinstance(event, dict) and event else data
+            recall = maybe_handle_lark_recall(config, payload)
+            if recall is not None:
+                return web.json_response(recall)
+            from bot.workflow_project_info_submit import maybe_handle_project_info_submit
+
+            submitted = maybe_handle_project_info_submit(config, payload)
+            if submitted is not None:
+                return web.json_response(submitted)
+            relay = maybe_handle_lark_relay(config, payload)
+            if relay is not None:
+                return web.json_response(relay)
+            bridged = maybe_handle_lark_bridge(config, payload)
+            if bridged is not None:
+                return web.json_response(bridged)
+            cand = ingest_lark_message_event(config, event if event else data)
+            if not cand:
+                return web.json_response({"ok": True, "matched": False})
+            result = await process_lark_reply_candidate(client, config, cand, kb=kb)
+            return web.json_response({"ok": True, "matched": True, **result})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("tech support event failed")
+            return web.json_response({"ok": False, "error": str(exc)[:200]}, status=500)
+
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    tech_path = str(getattr(config, "tech_support_event_path", "") or "/workflow/tech-support/event").strip() or "/workflow/tech-support/event"
+    if not tech_path.startswith("/"):
+        tech_path = "/" + tech_path
+    if tech_on:
+        app.router.add_post(tech_path, tech_support_event)
+        app.router.add_get(tech_path, health)
+        logger.info("tech support Lark event route %s", tech_path)
+    if live_on:
+        app.router.add_get(path, health)
+        app.router.add_post(path, live_handler)
+
+    live_link_path = str(
+        getattr(config, "workflow_live_link_sync_path", "")
+        or "/workflow/live-link-sync"
+    ).strip() or "/workflow/live-link-sync"
+    if not live_link_path.startswith("/"):
+        live_link_path = "/" + live_link_path
+
+    async def live_link_sync_handler(request: web.Request) -> web.Response:
+        """Lark automation: progress row created → sync 项目链接 into 已上线链接."""
+        try:
+            raw = await request.read()
+            data = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and data.get("type") == "url_verification":
+            return web.json_response({"challenge": data.get("challenge", "")})
+        if not _authorized(request, config):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        record_id, _project_name = _extract_payload(data)
+        if not record_id:
+            record_id = (request.rel_url.query.get("record_id") or "").strip() or None
+        if not record_id:
+            return web.json_response(
+                {"ok": False, "error": "need record_id"},
+                status=400,
+            )
+        try:
+            from bot.workflow_live_link_sync import sync_live_link_by_record_id
+
+            result = sync_live_link_by_record_id(config, record_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("live-link sync webhook failed record=%s", record_id)
+            return web.json_response(
+                {"ok": False, "error": str(exc)[:200]}, status=500
+            )
+        code = 200 if result.get("ok") else 422
+        return web.json_response(result, status=code)
+
+    if getattr(config, "workflow_live_link_sync_enabled", True) and _webhook_secret(
+        config
+    ):
+        app.router.add_get(live_link_path, health)
+        app.router.add_post(live_link_path, live_link_sync_handler)
+        logger.info("live-link sync webhook %s", live_link_path)
+
+    backlink_path = str(
+        getattr(config, "pr_backlink_path", "") or "/workflow/pr-backlink"
+    ).strip() or "/workflow/pr-backlink"
+    if not backlink_path.startswith("/"):
+        backlink_path = "/" + backlink_path
+
+    async def pr_backlink_handler(request: web.Request) -> web.Response:
+        """Lark automation on the PR table: 回链 filled → send that URL to the TG group."""
+        try:
+            raw = await request.read()
+            data = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and data.get("type") == "url_verification":
+            return web.json_response({"challenge": data.get("challenge", "")})
+        if not _authorized(request, config):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        try:
+            from bot.workflow_pr_backlink import handle_backlink_trigger
+
+            result = await handle_backlink_trigger(
+                client,
+                config,
+                scope,
+                data if isinstance(data, dict) else {},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("pr backlink webhook failed")
+            return web.json_response({"ok": False, "error": str(exc)[:200]}, status=500)
+        return web.json_response(result)
+
+    if backlink_on:
+        app.router.add_get(backlink_path, health)
+        app.router.add_post(backlink_path, pr_backlink_handler)
+        logger.info("PR backlink webhook %s", backlink_path)
+
+    host = getattr(config, "workflow_live_webhook_host", "0.0.0.0") or "0.0.0.0"
+    port = int(getattr(config, "workflow_live_webhook_port", 8787) or 8787)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=host, port=port)
+    try:
+        await site.start()
+    except OSError as exc:
+        await runner.cleanup()
+        if getattr(exc, "errno", None) == 98:
+            logger.error(
+                "Lark HTTP port %s is already in use; this account stays up without the webhook",
+                port,
+            )
+            return None
+        raise
+    routes = []
+    if live_on:
+        routes.append(path)
+    if tech_on:
+        routes.append(tech_path)
+    if getattr(config, "workflow_live_link_sync_enabled", True) and _webhook_secret(
+        config
+    ):
+        routes.append(live_link_path)
+    if backlink_on:
+        routes.append(backlink_path)
+    logger.info(
+        "Lark HTTP listening on http://%s:%s %s",
+        host,
+        port,
+        " ".join(routes) or "/health",
+    )
+    return runner

@@ -1,0 +1,7 @@
+# Add under workflow: in config/config.yaml (local only; not committed)
+  pr_capture:
+    enabled: true
+    commands: ["pr support"]
+    link_field: "KPI 2 - PR Announcement"
+    notify_enabled: true
+    notify_chat_id: "oc_xxxxxxxx"  # delivery ops Lark group
